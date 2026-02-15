@@ -18,7 +18,6 @@ jobs:
     name: Publish
     needs: ci
     runs-on: ubuntu-latest
-    environment: crates-io
     steps:
       - uses: actions/checkout@v4
 
