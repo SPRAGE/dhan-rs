@@ -16,7 +16,7 @@
 //!
 //! while let Some(msg) = stream.next().await {
 //!     match msg {
-//!         Ok(update) => println!("Order {} → {}", update.data.order_no, update.data.status),
+//!         Ok(update) => println!("Order {:?} → {:?}", update.Data.OrderNo, update.Data.Status),
 //!         Err(e) => eprintln!("Error: {e}"),
 //!     }
 //! }

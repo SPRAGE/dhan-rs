@@ -146,6 +146,7 @@ impl DhanClient {
     /// `tokenId` query parameter appended.
     ///
     /// ```
+    /// use dhan_rs::DhanClient;
     /// let url = DhanClient::consent_login_url("940b0ca1-3ff4-4476-b46e-03a3ce7dc55d");
     /// // → "https://auth.dhan.co/login/consentApp-login?consentAppId=940b0ca1-..."
     /// ```

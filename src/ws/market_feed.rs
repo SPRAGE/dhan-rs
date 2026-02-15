@@ -17,7 +17,7 @@
 //!
 //! // Subscribe to ticker data for HDFC Bank on NSE
 //! let instruments = vec![
-//!     Instrument { exchange_segment: "NSE_EQ".into(), security_id: "1333".into() },
+//!     Instrument::new("NSE_EQ", "1333"),
 //! ];
 //! stream.subscribe(FeedRequestCode::SubscribeTicker, &instruments).await?;
 //!

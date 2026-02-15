@@ -43,7 +43,8 @@
 //!
 //!     // Place an order
 //!     let req = PlaceOrderRequest {
-//!         dhan_client_id: Some("your-client-id".into()),
+//!         dhan_client_id: "your-client-id".into(),
+//!         correlation_id: None,
 //!         transaction_type: TransactionType::BUY,
 //!         exchange_segment: ExchangeSegment::NSE_EQ,
 //!         product_type: ProductType::INTRADAY,
@@ -52,7 +53,12 @@
 //!         security_id: "1333".into(),
 //!         quantity: 1,
 //!         price: Some(1500.0),
-//!         ..Default::default()
+//!         disclosed_quantity: None,
+//!         trigger_price: None,
+//!         after_market_order: None,
+//!         amo_time: None,
+//!         bo_profit_value: None,
+//!         bo_stop_loss_value: None,
 //!     };
 //!     let response = client.place_order(&req).await?;
 //!     println!("Order placed: {:?}", response);
