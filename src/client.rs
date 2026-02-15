@@ -49,7 +49,7 @@ pub struct DhanClient {
 impl DhanClient {
     /// Create a new `DhanClient` with the given client ID and access token.
     ///
-    /// Uses the default API base URL (`https://api.dhan.co/v2`).
+    /// Uses the default API base URL (`https://api.dhan.co`).
     pub fn new(client_id: impl Into<String>, access_token: impl Into<String>) -> Self {
         Self::with_base_url(client_id, access_token, API_BASE_URL)
     }

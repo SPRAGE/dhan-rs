@@ -9,7 +9,7 @@
 // ---------------------------------------------------------------------------
 
 /// Base URL for the DhanHQ REST API v2.
-pub const API_BASE_URL: &str = "https://api.dhan.co/v2";
+pub const API_BASE_URL: &str = "https://api.dhan.co";
 
 /// Base URL for authentication endpoints.
 pub const AUTH_BASE_URL: &str = "https://auth.dhan.co";
