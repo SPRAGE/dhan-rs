@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # =============================================================================
-# dhan-rs — Publish Script
+# dhan-rs — Release Script
 #
-# Validates, tags, and publishes a new version to crates.io + GitHub.
+# Validates, tags, and pushes to trigger GitHub Actions publishing.
+# The actual crates.io publish happens in CI via the publish.yml workflow.
 #
 # Usage:
-#   ./publish.sh              # Publish current version from Cargo.toml
-#   ./publish.sh 0.2.0        # Bump to 0.2.0, then publish
-#   ./publish.sh --dry-run    # Run all checks without actually publishing
+#   ./publish.sh              # Release current version from Cargo.toml
+#   ./publish.sh 0.2.0        # Bump to 0.2.0, then release
+#   ./publish.sh --dry-run    # Run all checks without actually releasing
 # =============================================================================
 
 RED='\033[0;31m'
@@ -161,12 +162,12 @@ fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Ready to publish ${CYAN}dhan-rs v${VERSION}${NC}"
+echo "  Ready to release ${CYAN}dhan-rs v${VERSION}${NC}"
 echo ""
 echo "  This will:"
 echo "    1. Create git tag ${CYAN}${TAG}${NC}"
-echo "    2. Push tag to origin (triggers CI/CD)"
-echo "    3. Publish to ${CYAN}crates.io${NC}"
+echo "    2. Push tag to origin"
+echo "    3. GitHub Actions will publish to ${CYAN}crates.io${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 printf "Continue? [y/N] "
@@ -178,20 +179,22 @@ info "Creating tag ${TAG}..."
 git tag -a "$TAG" -m "Release ${VERSION}"
 ok "Tag created: ${TAG}"
 
-info "Pushing tag to origin..."
+info "Pushing commits to origin..."
 git push origin main --quiet 2>/dev/null
-git push origin "$TAG" --quiet 2>/dev/null
-ok "Tag pushed"
+ok "Commits pushed"
 
-# Publish to crates.io
-info "Publishing to crates.io..."
-cargo publish
-ok "Published dhan-rs ${VERSION} to crates.io! 🎉"
+info "Pushing tag to origin..."
+git push origin "$TAG" --quiet 2>/dev/null
+ok "Tag ${TAG} pushed — GitHub Actions will publish to crates.io"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ${GREEN}✔ dhan-rs v${VERSION} published successfully!${NC}"
+echo "  ${GREEN}✔ dhan-rs v${VERSION} release triggered!${NC}"
 echo ""
+echo "  🚀 GitHub Actions will run CI and publish automatically."
+echo "  🔗 https://github.com/SPRAGE/dhan-rs/actions"
+echo ""
+echo "  Once published:"
 echo "  📦 https://crates.io/crates/dhan-rs"
 echo "  📖 https://docs.rs/dhan-rs"
 echo "  🏷️  https://github.com/SPRAGE/dhan-rs/releases/tag/${TAG}"
