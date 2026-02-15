@@ -80,11 +80,39 @@ impl DhanClient {
     /// This expires the current token and returns a new one.
     ///
     /// **Endpoint:** `GET /v2/RenewToken`
+    ///
+    /// # Note
+    ///
+    /// The RenewToken endpoint uses `dhanClientId` as its client
+    /// identification header, unlike most other endpoints that use `client-id`.
+    /// This method handles the difference automatically.
     pub async fn renew_token(&mut self) -> Result<TokenResponse> {
-        let token: TokenResponse = self.get("/v2/RenewToken").await?;
-        // Update the client's token so subsequent calls use the new one.
-        self.set_access_token(&token.access_token);
-        Ok(token)
+        let url = format!("{}/v2/RenewToken", self.base_url());
+
+        tracing::debug!(%url, "GET renew_token");
+
+        let resp = self
+            .http()
+            .get(&url)
+            .header("access-token", self.access_token())
+            .header("dhanClientId", self.client_id())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let bytes = resp.bytes().await.unwrap_or_default();
+
+        if status.is_success() {
+            let token: TokenResponse = serde_json::from_slice(&bytes).map_err(DhanError::Json)?;
+            // Update the client's token so subsequent calls use the new one.
+            self.set_access_token(&token.access_token);
+            Ok(token)
+        } else {
+            let body = String::from_utf8_lossy(&bytes);
+            Err(self.parse_error_body(status, &body))
+        }
     }
 
     // -----------------------------------------------------------------------

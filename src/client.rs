@@ -294,7 +294,7 @@ impl DhanClient {
 
     /// Try to parse the API's JSON error structure; fall back to a raw HTTP
     /// status error.
-    fn parse_error_body(&self, status: reqwest::StatusCode, body: &str) -> DhanError {
+    pub(crate) fn parse_error_body(&self, status: reqwest::StatusCode, body: &str) -> DhanError {
         if let Ok(api_err) = serde_json::from_str::<ApiErrorBody>(body) {
             if api_err.error_code.is_some() || api_err.error_message.is_some() {
                 return DhanError::Api(api_err);
