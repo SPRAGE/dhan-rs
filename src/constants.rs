@@ -1,3 +1,9 @@
+//! Constants for the DhanHQ API v2.
+//!
+//! Contains base URLs, WebSocket endpoints, and rate limit values.
+//! These are used internally by [`DhanClient`](crate::client::DhanClient)
+//! and the WebSocket stream types, but are also exported for advanced usage.
+
 // ---------------------------------------------------------------------------
 // Base URLs
 // ---------------------------------------------------------------------------
@@ -32,9 +38,13 @@ pub const WS_DEPTH_200_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth
 pub mod rate_limits {
     /// Orders API rate limits.
     pub mod orders {
+        /// Maximum order requests per second.
         pub const PER_SECOND: u32 = 10;
+        /// Maximum order requests per minute.
         pub const PER_MINUTE: u32 = 250;
+        /// Maximum order requests per hour.
         pub const PER_HOUR: u32 = 1000;
+        /// Maximum order requests per day.
         pub const PER_DAY: u32 = 7000;
         /// Maximum number of modifications allowed per single order.
         pub const MAX_MODIFICATIONS_PER_ORDER: u32 = 25;
@@ -42,17 +52,21 @@ pub mod rate_limits {
 
     /// Data API (REST snapshots) rate limits.
     pub mod data {
+        /// Maximum data requests per second.
         pub const PER_SECOND: u32 = 5;
+        /// Maximum data requests per day.
         pub const PER_DAY: u32 = 100_000;
     }
 
     /// Historical data API rate limits.
     pub mod historical {
+        /// Maximum historical data requests per second.
         pub const PER_SECOND: u32 = 1;
     }
 
     /// Instrument API rate limits.
     pub mod instruments {
+        /// Maximum instrument API requests per second.
         pub const PER_SECOND: u32 = 20;
     }
 
@@ -60,6 +74,7 @@ pub mod rate_limits {
     pub mod market_quote {
         /// Maximum instruments per single LTP/OHLC/Quote request.
         pub const MAX_INSTRUMENTS_PER_REQUEST: u32 = 1000;
+        /// Maximum market quote requests per second.
         pub const PER_SECOND: u32 = 1;
     }
 

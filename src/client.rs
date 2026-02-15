@@ -1,3 +1,12 @@
+//! Core HTTP client for the DhanHQ REST API v2.
+//!
+//! The [`DhanClient`] struct is the main entry point for interacting with all
+//! DhanHQ REST API endpoints. It wraps [`reqwest::Client`] with authentication
+//! headers and provides typed `get`, `post`, `put`, and `delete` methods.
+//!
+//! API endpoint methods are added to `DhanClient` via `impl` blocks in the
+//! [`crate::api`] module.
+
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::Serialize;

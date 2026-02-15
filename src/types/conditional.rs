@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Conditional Trigger types.
 
 use serde::{Deserialize, Serialize};

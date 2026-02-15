@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Historical Data types — Daily and Intraday candles.
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,17 @@
+//! Error types for the `dhan-rs` crate.
+//!
+//! All fallible operations in this crate return [`Result<T>`], which is an
+//! alias for `std::result::Result<T, DhanError>`.
+//!
+//! [`DhanError`] covers:
+//! - **API errors** — Structured error responses from DhanHQ (codes DH-901 to DH-910)
+//! - **HTTP status errors** — Unexpected status codes with response body
+//! - **HTTP transport errors** — Network, TLS, timeout failures
+//! - **JSON errors** — Deserialization failures
+//! - **WebSocket errors** — Connection and protocol errors
+//! - **URL errors** — Malformed URL construction
+//! - **Invalid arguments** — Client-side validation errors
+
 use std::fmt;
 
 /// Error response returned by the DhanHQ API.
@@ -37,7 +51,9 @@ pub enum DhanError {
     /// The server returned an unexpected HTTP status code.
     #[error("HTTP {status}: {body}")]
     HttpStatus {
+        /// The HTTP status code.
         status: reqwest::StatusCode,
+        /// The response body text.
         body: String,
     },
 

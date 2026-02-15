@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Live Market Feed WebSocket client.
 //!
 //! Connects to `wss://api-feed.dhan.co` and streams real-time market data as

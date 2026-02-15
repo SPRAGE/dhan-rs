@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Trader's Control types — Kill Switch, P&L Based Exit.
 
 use serde::{Deserialize, Serialize};

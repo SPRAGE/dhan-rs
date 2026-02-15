@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Live Order Update WebSocket client.
 //!
 //! Connects to `wss://api-order-update.dhan.co` and streams real-time order

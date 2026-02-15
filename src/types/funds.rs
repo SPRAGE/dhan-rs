@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Funds & Margin types.
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Statement types — Ledger Report, Trade History.
 
 use serde::Deserialize;

@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! EDIS types — T-PIN, form generation, inquiry.
 
 use serde::{Deserialize, Serialize};

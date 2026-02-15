@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Postback (webhook) payload types.
 //!
 //! When you configure a Postback URL during access-token generation, Dhan sends

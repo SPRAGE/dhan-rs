@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Market Quote types — LTP, OHLC, Market Depth (REST snapshots).
 
 use std::collections::HashMap;

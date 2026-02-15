@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Option Chain types — chain data, greeks, expiry list.
 
 use std::collections::HashMap;

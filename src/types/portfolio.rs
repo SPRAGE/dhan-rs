@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Portfolio types — Holdings, Positions, Convert Position.
 
 use serde::{Deserialize, Serialize};

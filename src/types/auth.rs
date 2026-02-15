@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Types for authentication endpoints.
 
 use serde::{Deserialize, Serialize};

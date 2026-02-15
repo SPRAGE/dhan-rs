@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Shared enum types that map directly to DhanHQ API string values.
 //!
 //! Variant names use `SCREAMING_SNAKE_CASE` to match the JSON wire format

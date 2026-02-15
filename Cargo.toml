@@ -2,9 +2,17 @@
 name = "dhan-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Rust client library for the DhanHQ Broker API v2"
+rust-version = "1.85"
+description = "Unofficial Rust client library for the DhanHQ Broker API v2 — orders, market data, WebSocket feeds, and more"
 license = "MIT"
-repository = "https://github.com/yourusername/dhan-rs"
+repository = "https://github.com/SPRAGE/dhan-rs"
+homepage = "https://github.com/SPRAGE/dhan-rs"
+documentation = "https://docs.rs/dhan-rs"
+readme = "README.md"
+keywords = ["dhan", "trading", "broker", "api", "finance"]
+categories = ["api-bindings", "finance"]
+authors = ["SPRAGE"]
+exclude = ["PLAN.md", "flake.nix", "flake.lock", ".direnv/"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

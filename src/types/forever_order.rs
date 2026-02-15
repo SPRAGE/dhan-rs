@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Forever Order (GTT) types.
 
 use serde::{Deserialize, Serialize};
