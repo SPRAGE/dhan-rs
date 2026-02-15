@@ -373,7 +373,7 @@ impl Stream for OrderUpdateStream {
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(DhanError::WebSocket(e))));
+                    return Poll::Ready(Some(Err(DhanError::WebSocket(Box::new(e)))));
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,

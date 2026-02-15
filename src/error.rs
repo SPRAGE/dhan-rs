@@ -65,9 +65,9 @@ pub enum DhanError {
     #[error("JSON deserialization error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// A WebSocket-level error.
+    /// A WebSocket-level error (boxed to keep `Result<T>` small).
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
 
     /// An error building or parsing a URL.
     #[error("URL error: {0}")]
@@ -76,6 +76,12 @@ pub enum DhanError {
     /// The caller provided an invalid argument.
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for DhanError {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        DhanError::WebSocket(Box::new(err))
+    }
 }
 
 /// Convenience alias used throughout the crate.
