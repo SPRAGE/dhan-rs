@@ -393,7 +393,8 @@ async fn test_trade_history() {
 
 #[tokio::test]
 async fn test_invalid_token_returns_api_error() {
-    // Use an intentionally invalid token — should get DH-901.
+    // Use an intentionally invalid token — should get DH-901 (or a raw 401/403
+    // if a WAF/CDN intercepts the request before the API layer).
     let client = DhanClient::with_base_url("invalid", "invalid-token", SANDBOX_BASE_URL);
     let err = client.get_profile().await.unwrap_err();
     match &err {
@@ -401,7 +402,14 @@ async fn test_invalid_token_returns_api_error() {
             assert_eq!(body.error_code.as_deref(), Some("DH-901"));
             println!("✔ Auth error correctly parsed: {body}");
         }
-        other => panic!("Expected DhanError::Api, got: {other:?}"),
+        DhanError::HttpStatus { status, .. } => {
+            assert!(
+                status.as_u16() == 401 || status.as_u16() == 403,
+                "Expected 401 or 403, got {status}"
+            );
+            println!("✔ Auth rejected with HTTP {status} (WAF/CDN response)");
+        }
+        other => panic!("Expected DhanError::Api or HttpStatus, got: {other:?}"),
     }
 }
 
