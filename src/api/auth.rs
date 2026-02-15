@@ -66,10 +66,7 @@ impl DhanClient {
                     return Err(DhanError::Api(api_err));
                 }
             }
-            Err(DhanError::HttpStatus {
-                status,
-                body,
-            })
+            Err(DhanError::HttpStatus { status, body })
         }
     }
 
@@ -117,12 +114,18 @@ impl DhanClient {
         let http = reqwest::Client::new();
         let resp = http
             .post(&url)
-            .header("app_id", HeaderValue::from_str(app_id).map_err(|_| {
-                DhanError::InvalidArgument("app_id contains invalid characters".into())
-            })?)
-            .header("app_secret", HeaderValue::from_str(app_secret).map_err(|_| {
-                DhanError::InvalidArgument("app_secret contains invalid characters".into())
-            })?)
+            .header(
+                "app_id",
+                HeaderValue::from_str(app_id).map_err(|_| {
+                    DhanError::InvalidArgument("app_id contains invalid characters".into())
+                })?,
+            )
+            .header(
+                "app_secret",
+                HeaderValue::from_str(app_secret).map_err(|_| {
+                    DhanError::InvalidArgument("app_secret contains invalid characters".into())
+                })?,
+            )
             .send()
             .await?;
 
@@ -174,12 +177,18 @@ impl DhanClient {
         let http = reqwest::Client::new();
         let resp = http
             .post(&url)
-            .header("app_id", HeaderValue::from_str(app_id).map_err(|_| {
-                DhanError::InvalidArgument("app_id contains invalid characters".into())
-            })?)
-            .header("app_secret", HeaderValue::from_str(app_secret).map_err(|_| {
-                DhanError::InvalidArgument("app_secret contains invalid characters".into())
-            })?)
+            .header(
+                "app_id",
+                HeaderValue::from_str(app_id).map_err(|_| {
+                    DhanError::InvalidArgument("app_id contains invalid characters".into())
+                })?,
+            )
+            .header(
+                "app_secret",
+                HeaderValue::from_str(app_secret).map_err(|_| {
+                    DhanError::InvalidArgument("app_secret contains invalid characters".into())
+                })?,
+            )
             .send()
             .await?;
 
@@ -211,12 +220,18 @@ impl DhanClient {
         let http = reqwest::Client::new();
         let resp = http
             .post(&url)
-            .header("partner_id", HeaderValue::from_str(partner_id).map_err(|_| {
-                DhanError::InvalidArgument("partner_id contains invalid characters".into())
-            })?)
-            .header("partner_secret", HeaderValue::from_str(partner_secret).map_err(|_| {
-                DhanError::InvalidArgument("partner_secret contains invalid characters".into())
-            })?)
+            .header(
+                "partner_id",
+                HeaderValue::from_str(partner_id).map_err(|_| {
+                    DhanError::InvalidArgument("partner_id contains invalid characters".into())
+                })?,
+            )
+            .header(
+                "partner_secret",
+                HeaderValue::from_str(partner_secret).map_err(|_| {
+                    DhanError::InvalidArgument("partner_secret contains invalid characters".into())
+                })?,
+            )
             .send()
             .await?;
 
@@ -235,10 +250,7 @@ impl DhanClient {
     /// Open this URL in a browser. After the user authenticates, they will be
     /// redirected with a `tokenId` query parameter.
     pub fn partner_consent_login_url(consent_id: &str) -> String {
-        format!(
-            "{}/consent-login?consentId={}",
-            AUTH_BASE_URL, consent_id
-        )
+        format!("{}/consent-login?consentId={}", AUTH_BASE_URL, consent_id)
     }
 
     /// **Step 3 (Partner):** Consume the partner consent to obtain an access token.
@@ -259,12 +271,18 @@ impl DhanClient {
         let http = reqwest::Client::new();
         let resp = http
             .post(&url)
-            .header("partner_id", HeaderValue::from_str(partner_id).map_err(|_| {
-                DhanError::InvalidArgument("partner_id contains invalid characters".into())
-            })?)
-            .header("partner_secret", HeaderValue::from_str(partner_secret).map_err(|_| {
-                DhanError::InvalidArgument("partner_secret contains invalid characters".into())
-            })?)
+            .header(
+                "partner_id",
+                HeaderValue::from_str(partner_id).map_err(|_| {
+                    DhanError::InvalidArgument("partner_id contains invalid characters".into())
+                })?,
+            )
+            .header(
+                "partner_secret",
+                HeaderValue::from_str(partner_secret).map_err(|_| {
+                    DhanError::InvalidArgument("partner_secret contains invalid characters".into())
+                })?,
+            )
             .send()
             .await?;
 

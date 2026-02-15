@@ -12,10 +12,7 @@ impl DhanClient {
     /// Rate limit: 1 unique request every 3 seconds.
     ///
     /// **Endpoint:** `POST /v2/optionchain`
-    pub async fn get_option_chain(
-        &self,
-        req: &OptionChainRequest,
-    ) -> Result<OptionChainResponse> {
+    pub async fn get_option_chain(&self, req: &OptionChainRequest) -> Result<OptionChainResponse> {
         self.post("/v2/optionchain", req).await
     }
 
@@ -24,10 +21,7 @@ impl DhanClient {
     /// Rate limit: 1 unique request every 3 seconds.
     ///
     /// **Endpoint:** `POST /v2/optionchain/expirylist`
-    pub async fn get_expiry_list(
-        &self,
-        req: &ExpiryListRequest,
-    ) -> Result<ExpiryListResponse> {
+    pub async fn get_expiry_list(&self, req: &ExpiryListRequest) -> Result<ExpiryListResponse> {
         self.post("/v2/optionchain/expirylist", req).await
     }
 }

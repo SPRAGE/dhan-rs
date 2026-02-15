@@ -8,8 +8,8 @@
 //! [`crate::api`] module.
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::constants::API_BASE_URL;
 use crate::error::{ApiErrorBody, DhanError, Result};
@@ -132,11 +132,7 @@ impl DhanClient {
     }
 
     /// Perform a POST request with a JSON body and deserialize the response.
-    pub async fn post<B: Serialize, R: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<R> {
+    pub async fn post<B: Serialize, R: DeserializeOwned>(&self, path: &str, body: &B) -> Result<R> {
         let url = self.url(path);
         tracing::debug!(%url, "POST");
 
@@ -152,11 +148,7 @@ impl DhanClient {
     }
 
     /// Perform a PUT request with a JSON body and deserialize the response.
-    pub async fn put<B: Serialize, R: DeserializeOwned>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<R> {
+    pub async fn put<B: Serialize, R: DeserializeOwned>(&self, path: &str, body: &B) -> Result<R> {
         let url = self.url(path);
         tracing::debug!(%url, "PUT");
 
@@ -266,7 +258,10 @@ impl DhanClient {
     /// Default headers applied to every request.
     fn default_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
         headers
     }
@@ -284,10 +279,7 @@ impl DhanClient {
     ///
     /// Uses `bytes()` + `serde_json::from_slice()` to avoid the overhead of
     /// UTF-8 validation that `text()` + `from_str()` would incur.
-    async fn handle_response<R: DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<R> {
+    async fn handle_response<R: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<R> {
         let status = resp.status();
         let bytes = resp.bytes().await.unwrap_or_default();
 

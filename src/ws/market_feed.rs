@@ -39,7 +39,7 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::constants::WS_MARKET_FEED_URL;
 use crate::error::{DhanError, Result};
@@ -428,8 +428,12 @@ fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
 
             // 5 depth levels × 20 bytes each — stack-allocated array
             let mut depth = [DepthLevel {
-                bid_qty: 0, ask_qty: 0, bid_orders: 0, ask_orders: 0,
-                bid_price: 0.0, ask_price: 0.0,
+                bid_qty: 0,
+                ask_qty: 0,
+                bid_orders: 0,
+                ask_orders: 0,
+                bid_price: 0.0,
+                ask_price: 0.0,
             }; 5];
             for level in &mut depth {
                 level.bid_qty = read_i32_le(payload, &mut off);
@@ -594,15 +598,13 @@ impl Stream for MarketFeedStream {
             match self.read.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
                     match msg {
-                        Message::Binary(data) => {
-                            match parse_packet(&data) {
-                                Ok(event) => return Poll::Ready(Some(Ok(event))),
-                                Err(e) => {
-                                    tracing::warn!("Failed to parse market feed packet: {e}");
-                                    return Poll::Ready(Some(Err(e)));
-                                }
+                        Message::Binary(data) => match parse_packet(&data) {
+                            Ok(event) => return Poll::Ready(Some(Ok(event))),
+                            Err(e) => {
+                                tracing::warn!("Failed to parse market feed packet: {e}");
+                                return Poll::Ready(Some(Err(e)));
                             }
-                        }
+                        },
                         Message::Ping(_) | Message::Pong(_) => {
                             // Ping/pong handled automatically by tungstenite
                             continue;

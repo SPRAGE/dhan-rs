@@ -10,10 +10,7 @@ impl DhanClient {
     /// Data is available back to the instrument's inception date.
     ///
     /// **Endpoint:** `POST /v2/charts/historical`
-    pub async fn get_daily_historical(
-        &self,
-        req: &HistoricalDataRequest,
-    ) -> Result<CandleData> {
+    pub async fn get_daily_historical(&self, req: &HistoricalDataRequest) -> Result<CandleData> {
         self.post("/v2/charts/historical", req).await
     }
 
@@ -23,10 +20,7 @@ impl DhanClient {
     /// Only 90 days of data can be polled per request.
     ///
     /// **Endpoint:** `POST /v2/charts/intraday`
-    pub async fn get_intraday_historical(
-        &self,
-        req: &IntradayDataRequest,
-    ) -> Result<CandleData> {
+    pub async fn get_intraday_historical(&self, req: &IntradayDataRequest) -> Result<CandleData> {
         self.post("/v2/charts/intraday", req).await
     }
 }

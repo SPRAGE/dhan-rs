@@ -9,10 +9,7 @@ impl DhanClient {
     /// Place a new super order.
     ///
     /// **Endpoint:** `POST /v2/super/orders`
-    pub async fn place_super_order(
-        &self,
-        req: &PlaceSuperOrderRequest,
-    ) -> Result<OrderResponse> {
+    pub async fn place_super_order(&self, req: &PlaceSuperOrderRequest) -> Result<OrderResponse> {
         self.post("/v2/super/orders", req).await
     }
 
@@ -32,11 +29,7 @@ impl DhanClient {
     /// Cancelling the `ENTRY_LEG` cancels all legs.
     ///
     /// **Endpoint:** `DELETE /v2/super/orders/{order-id}/{order-leg}`
-    pub async fn cancel_super_order(
-        &self,
-        order_id: &str,
-        leg: &str,
-    ) -> Result<OrderResponse> {
+    pub async fn cancel_super_order(&self, order_id: &str, leg: &str) -> Result<OrderResponse> {
         self.delete(&format!("/v2/super/orders/{order_id}/{leg}"))
             .await
     }

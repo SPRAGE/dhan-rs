@@ -54,10 +54,7 @@ impl DhanClient {
     /// Retrieve an order by its correlation ID.
     ///
     /// **Endpoint:** `GET /v2/orders/external/{correlation-id}`
-    pub async fn get_order_by_correlation_id(
-        &self,
-        correlation_id: &str,
-    ) -> Result<OrderDetail> {
+    pub async fn get_order_by_correlation_id(&self, correlation_id: &str) -> Result<OrderDetail> {
         self.get(&format!("/v2/orders/external/{correlation_id}"))
             .await
     }

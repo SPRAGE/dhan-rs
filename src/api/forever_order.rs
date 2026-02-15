@@ -32,8 +32,7 @@ impl DhanClient {
     ///
     /// **Endpoint:** `DELETE /v2/forever/orders/{order-id}`
     pub async fn delete_forever_order(&self, order_id: &str) -> Result<OrderResponse> {
-        self.delete(&format!("/v2/forever/orders/{order_id}"))
-            .await
+        self.delete(&format!("/v2/forever/orders/{order_id}")).await
     }
 
     /// Retrieve all existing forever orders.

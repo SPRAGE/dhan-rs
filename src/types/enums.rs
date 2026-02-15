@@ -303,7 +303,10 @@ pub enum FeedRequestCode {
 }
 
 impl Serialize for FeedRequestCode {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_u8(*self as u8)
     }
 }

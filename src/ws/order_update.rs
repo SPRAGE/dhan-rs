@@ -32,7 +32,7 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::constants::WS_ORDER_UPDATE_URL;
 use crate::error::{DhanError, Result};
@@ -302,16 +302,16 @@ impl OrderUpdateStream {
 
         tracing::info!("Connected to order-update WebSocket");
 
-        Ok(Self { read, _write: write })
+        Ok(Self {
+            read,
+            _write: write,
+        })
     }
 
     /// Connect to the order-update WebSocket as a partner.
     ///
     /// Partner platforms receive order updates for all connected users.
-    pub async fn connect_partner(
-        partner_id: &str,
-        partner_secret: &str,
-    ) -> Result<Self> {
+    pub async fn connect_partner(partner_id: &str, partner_secret: &str) -> Result<Self> {
         let (ws, _resp) = connect_async(WS_ORDER_UPDATE_URL).await?;
 
         let (mut write, read) = ws.split();
@@ -329,7 +329,10 @@ impl OrderUpdateStream {
 
         tracing::info!("Connected to order-update WebSocket (partner mode)");
 
-        Ok(Self { read, _write: write })
+        Ok(Self {
+            read,
+            _write: write,
+        })
     }
 
     /// Close the WebSocket connection gracefully.
