@@ -15,5 +15,5 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-byteorder = "1"
 url = "2"
+futures-util = { version = "0.3.32", features = ["sink"] }

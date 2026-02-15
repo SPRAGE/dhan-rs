@@ -18,6 +18,12 @@ pub const WS_MARKET_FEED_URL: &str = "wss://api-feed.dhan.co";
 /// WebSocket endpoint for live order updates (JSON).
 pub const WS_ORDER_UPDATE_URL: &str = "wss://api-order-update.dhan.co";
 
+/// WebSocket endpoint for 20-level full market depth (binary).
+pub const WS_DEPTH_20_URL: &str = "wss://depth-api-feed.dhan.co/twentydepth";
+
+/// WebSocket endpoint for 200-level full market depth (binary).
+pub const WS_DEPTH_200_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth";
+
 // ---------------------------------------------------------------------------
 // Rate Limits
 // ---------------------------------------------------------------------------

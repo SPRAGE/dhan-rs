@@ -20,6 +20,7 @@ pub mod client;
 pub mod constants;
 pub mod error;
 pub mod types;
+pub mod ws;
 
 /// Re-export the main client type at crate root for convenience.
 pub use client::DhanClient;

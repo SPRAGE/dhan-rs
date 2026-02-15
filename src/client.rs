@@ -8,7 +8,8 @@ use crate::error::{ApiErrorBody, DhanError, Result};
 /// Core HTTP client for the DhanHQ REST API v2.
 ///
 /// Wraps [`reqwest::Client`] and injects the required authentication headers
-/// into every request.
+/// into every request. Auth header values are cached at construction time to
+/// avoid per-request allocation.
 ///
 /// # Example
 ///
@@ -31,6 +32,9 @@ pub struct DhanClient {
     access_token: String,
     /// Base URL for REST API requests (defaults to [`API_BASE_URL`]).
     base_url: String,
+    /// Pre-built auth header values, cached to avoid per-request allocation.
+    auth_header_token: HeaderValue,
+    auth_header_client_id: HeaderValue,
 }
 
 impl DhanClient {
@@ -54,11 +58,21 @@ impl DhanClient {
             .build()
             .expect("failed to build reqwest client");
 
+        let access_token = access_token.into();
+        let client_id = client_id.into();
+
+        let auth_header_token = HeaderValue::from_str(&access_token)
+            .expect("access token contains invalid header characters");
+        let auth_header_client_id = HeaderValue::from_str(&client_id)
+            .expect("client id contains invalid header characters");
+
         Self {
             http,
-            client_id: client_id.into(),
-            access_token: access_token.into(),
+            client_id,
+            access_token,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            auth_header_token,
+            auth_header_client_id,
         }
     }
 
@@ -80,6 +94,8 @@ impl DhanClient {
     /// Replace the access token (e.g. after renewal).
     pub fn set_access_token(&mut self, token: impl Into<String>) {
         self.access_token = token.into();
+        self.auth_header_token = HeaderValue::from_str(&self.access_token)
+            .expect("access token contains invalid header characters");
     }
 
     /// Returns the base URL.
@@ -246,34 +262,31 @@ impl DhanClient {
         headers
     }
 
-    /// Per-request auth headers.
+    /// Per-request auth headers. Uses cached [`HeaderValue`]s — only the
+    /// [`HeaderMap`] container is allocated per call (no string parsing).
     fn auth_headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "access-token",
-            HeaderValue::from_str(&self.access_token)
-                .expect("access token contains invalid header characters"),
-        );
-        // Some data endpoints require client-id header
-        headers.insert(
-            "client-id",
-            HeaderValue::from_str(&self.client_id)
-                .expect("client id contains invalid header characters"),
-        );
+        let mut headers = HeaderMap::with_capacity(2);
+        headers.insert("access-token", self.auth_header_token.clone());
+        headers.insert("client-id", self.auth_header_client_id.clone());
         headers
     }
 
     /// Read a response, returning either the deserialized body or a `DhanError`.
+    ///
+    /// Uses `bytes()` + `serde_json::from_slice()` to avoid the overhead of
+    /// UTF-8 validation that `text()` + `from_str()` would incur.
     async fn handle_response<R: DeserializeOwned>(
         &self,
         resp: reqwest::Response,
     ) -> Result<R> {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let bytes = resp.bytes().await.unwrap_or_default();
 
         if status.is_success() {
-            serde_json::from_str(&body).map_err(DhanError::Json)
+            serde_json::from_slice(&bytes).map_err(DhanError::Json)
         } else {
+            // Error path: parse as string for the error body
+            let body = String::from_utf8_lossy(&bytes);
             Err(self.parse_error_body(status, &body))
         }
     }

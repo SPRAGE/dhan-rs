@@ -11,6 +11,7 @@ pub mod market_quote;
 pub mod option_chain;
 pub mod orders;
 pub mod portfolio;
+pub mod postback;
 pub mod profile;
 pub mod statements;
 pub mod super_order;
