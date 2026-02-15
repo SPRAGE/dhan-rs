@@ -130,7 +130,7 @@
 
 #![warn(missing_docs)]
 #![allow(clippy::doc_markdown)]
-#![doc(html_root_url = "https://docs.rs/dhan-rs/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/dhan-rs/0.1.1")]
 
 pub mod api;
 pub mod client;
