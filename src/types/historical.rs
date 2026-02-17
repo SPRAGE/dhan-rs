@@ -70,8 +70,8 @@ pub struct CandleData {
     pub close: Vec<f64>,
     pub volume: Vec<f64>,
     /// Epoch timestamps (seconds).
-    pub timestamp: Vec<i64>,
+    pub timestamp: Vec<f64>,
     /// Open interest (empty or zeroed for equity).
     #[serde(default)]
-    pub open_interest: Vec<i64>,
+    pub open_interest: Vec<f64>,
 }
