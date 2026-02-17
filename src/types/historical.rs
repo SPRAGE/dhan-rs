@@ -68,7 +68,7 @@ pub struct CandleData {
     pub high: Vec<f64>,
     pub low: Vec<f64>,
     pub close: Vec<f64>,
-    pub volume: Vec<i64>,
+    pub volume: Vec<f64>,
     /// Epoch timestamps (seconds).
     pub timestamp: Vec<i64>,
     /// Open interest (empty or zeroed for equity).
