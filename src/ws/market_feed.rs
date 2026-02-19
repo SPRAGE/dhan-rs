@@ -292,8 +292,17 @@ fn read_f32_le(data: &[u8], offset: &mut usize) -> f32 {
     v
 }
 
-/// Parse the 8-byte packet header.
-fn parse_header(data: &[u8]) -> Result<PacketHeader> {
+/// Parse the 8-byte packet header from a raw binary market feed packet.
+///
+/// The header layout (little-endian):
+///
+/// | Offset | Size | Field |
+/// |--------|------|------------------|
+/// | 0      | 1    | Response code    |
+/// | 1      | 2    | Message length   |
+/// | 3      | 1    | Exchange segment |
+/// | 4      | 4    | Security ID      |
+pub fn parse_header(data: &[u8]) -> Result<PacketHeader> {
     if data.len() < 8 {
         return Err(DhanError::InvalidArgument(format!(
             "packet too short for header: {} bytes",
@@ -322,7 +331,13 @@ fn parse_header(data: &[u8]) -> Result<PacketHeader> {
 }
 
 /// Parse a complete binary packet into a [`MarketFeedEvent`].
-fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
+///
+/// The input `data` should be a full binary WebSocket message as received
+/// from DhanHQ, starting with the 8-byte packet header.
+///
+/// This is also useful for parsing raw frames obtained from
+/// [`DhanFeedManager::get_raw_channel`](super::manager::DhanFeedManager::get_raw_channel).
+pub fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
     let header = parse_header(data)?;
     let payload = &data[8..];
 

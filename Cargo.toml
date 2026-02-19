@@ -25,6 +25,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 url = "2"
 futures-util = { version = "0.3.32", features = ["sink"] }
+bytes = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
