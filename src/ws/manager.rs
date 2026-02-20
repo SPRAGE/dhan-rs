@@ -30,7 +30,7 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use dhan_rs::ws::manager::{DhanFeedManagerBuilder, DhanFeedManager};
+//! use dhan_rs::ws::manager::{DhanFeedManagerBuilder, DhanFeedManager, ConnectionId};
 //! use dhan_rs::ws::market_feed::Instrument;
 //! use dhan_rs::types::enums::FeedRequestCode;
 //!
@@ -215,10 +215,7 @@ pub struct DhanFeedManagerBuilder {
 
 impl DhanFeedManagerBuilder {
     /// Create a new builder with the given credentials.
-    pub fn new(
-        client_id: impl Into<String>,
-        access_token: impl Into<String>,
-    ) -> Self {
+    pub fn new(client_id: impl Into<String>, access_token: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
             access_token: access_token.into(),
@@ -228,7 +225,7 @@ impl DhanFeedManagerBuilder {
 
     /// Set maximum number of connections (1–5). Default: 5.
     pub fn max_connections(mut self, n: u8) -> Self {
-        self.config.max_connections = n.min(5).max(1);
+        self.config.max_connections = n.clamp(1, 5);
         self
     }
 
@@ -314,10 +311,8 @@ struct ManagedConnection {
     reconnect_count: u64,
 }
 
-type WriterHalf = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<TcpStream>>,
-    Message,
->;
+type WriterHalf =
+    futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 // ---------------------------------------------------------------------------
 // DhanFeedManager
@@ -417,9 +412,7 @@ impl DhanFeedManager {
     /// frames, parses them, and distributes events on broadcast channels.
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
-            return Err(DhanError::InvalidArgument(
-                "manager already started".into(),
-            ));
+            return Err(DhanError::InvalidArgument("manager already started".into()));
         }
 
         for conn in &mut self.connections {
@@ -512,9 +505,7 @@ impl DhanFeedManager {
         mode: FeedRequestCode,
     ) -> Result<()> {
         if !self.started {
-            return Err(DhanError::InvalidArgument(
-                "manager not started".into(),
-            ));
+            return Err(DhanError::InvalidArgument("manager not started".into()));
         }
 
         // Group instruments by which connection they're on
@@ -594,10 +585,7 @@ impl DhanFeedManager {
     ///
     /// Returns `None` if the connection ID is out of range or raw frames
     /// were not enabled in the config.
-    pub fn get_raw_channel(
-        &self,
-        id: ConnectionId,
-    ) -> Option<broadcast::Receiver<Bytes>> {
+    pub fn get_raw_channel(&self, id: ConnectionId) -> Option<broadcast::Receiver<Bytes>> {
         self.connections
             .get(id.0 as usize)
             .and_then(|c| c.raw_tx.as_ref().map(|tx| tx.subscribe()))
@@ -606,16 +594,10 @@ impl DhanFeedManager {
     /// Get raw-frame receivers from **all** connections.
     ///
     /// Returns an empty vec if raw frames are not enabled.
-    pub fn get_all_raw_channels(
-        &self,
-    ) -> Vec<(ConnectionId, broadcast::Receiver<Bytes>)> {
+    pub fn get_all_raw_channels(&self) -> Vec<(ConnectionId, broadcast::Receiver<Bytes>)> {
         self.connections
             .iter()
-            .filter_map(|c| {
-                c.raw_tx
-                    .as_ref()
-                    .map(|tx| (c.id, tx.subscribe()))
-            })
+            .filter_map(|c| c.raw_tx.as_ref().map(|tx| (c.id, tx.subscribe())))
             .collect()
     }
 
@@ -626,10 +608,7 @@ impl DhanFeedManager {
             .iter()
             .map(|c| ConnectionHealth {
                 id: c.id,
-                is_alive: c
-                    .task
-                    .as_ref()
-                    .is_some_and(|t| !t.is_finished()),
+                is_alive: c.task.as_ref().is_some_and(|t| !t.is_finished()),
                 instrument_count: c.instruments.len(),
                 reconnect_count: c.reconnect_count,
             })
@@ -720,9 +699,7 @@ impl DhanFeedManager {
                 .enumerate()
                 .min_by_key(|&(_, load)| *load)
                 .map(|(idx, _)| idx)
-                .ok_or_else(|| {
-                    DhanError::InvalidArgument("no connections available".into())
-                })?;
+                .ok_or_else(|| DhanError::InvalidArgument("no connections available".into()))?;
 
             if conn_loads[best_idx] >= max_per {
                 return Err(DhanError::InvalidArgument(format!(
@@ -796,11 +773,10 @@ impl DhanFeedManager {
     ///
     /// Reads frames, parses binary packets, broadcasts events, and handles
     /// reconnection on failure.
+    #[allow(clippy::too_many_arguments)]
     async fn connection_loop(
         conn_id: ConnectionId,
-        mut read: futures_util::stream::SplitStream<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-        >,
+        mut read: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         writer: Arc<Mutex<Option<WriterHalf>>>,
         parsed_tx: broadcast::Sender<MarketFeedEvent>,
         raw_tx: Option<broadcast::Sender<Bytes>>,
@@ -813,12 +789,7 @@ impl DhanFeedManager {
     ) {
         // Re-subscribe existing instruments after initial connect or reconnect
         if !existing_subs.is_empty() {
-            if let Err(e) = Self::resubscribe(
-                &writer,
-                &existing_subs,
-            )
-            .await
-            {
+            if let Err(e) = Self::resubscribe(&writer, &existing_subs).await {
                 tracing::error!(
                     connection = %conn_id,
                     error = %e,
@@ -944,10 +915,7 @@ impl DhanFeedManager {
         // Group by mode
         let mut by_mode: HashMap<u8, Vec<Instrument>> = HashMap::new();
         for (inst, mode) in subs {
-            by_mode
-                .entry(*mode as u8)
-                .or_default()
-                .push(inst.clone());
+            by_mode.entry(*mode as u8).or_default().push(inst.clone());
         }
 
         let mut guard = writer.lock().await;
