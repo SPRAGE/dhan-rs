@@ -26,8 +26,7 @@ async fn main() -> dhan_rs::error::Result<()> {
         )
         .init();
 
-    let client_id =
-        env::var("DHAN_CLIENT_ID").expect("set DHAN_CLIENT_ID env var before running");
+    let client_id = env::var("DHAN_CLIENT_ID").expect("set DHAN_CLIENT_ID env var before running");
     let access_token =
         env::var("DHAN_ACCESS_TOKEN").expect("set DHAN_ACCESS_TOKEN env var before running");
 
