@@ -26,6 +26,14 @@ tracing = "0.1"
 url = "2"
 futures-util = { version = "0.3.32", features = ["sink"] }
 bytes = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[[bin]]
+name = "ws_check"
+required-features = ["cli"]
+
+[features]
+cli = ["tracing-subscriber"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
