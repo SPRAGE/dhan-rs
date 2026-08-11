@@ -1,6 +1,6 @@
 //! Order management endpoints.
 
-use crate::client::DhanClient;
+use crate::client::{DhanClient, required_path_segment};
 use crate::error::Result;
 use crate::types::orders::*;
 
@@ -20,6 +20,7 @@ impl DhanClient {
         order_id: &str,
         req: &ModifyOrderRequest,
     ) -> Result<OrderResponse> {
+        let order_id = required_path_segment("order_id", order_id)?;
         self.put(&format!("/v2/orders/{order_id}"), req).await
     }
 
@@ -27,6 +28,7 @@ impl DhanClient {
     ///
     /// **Endpoint:** `DELETE /v2/orders/{order-id}`
     pub async fn cancel_order(&self, order_id: &str) -> Result<OrderResponse> {
+        let order_id = required_path_segment("order_id", order_id)?;
         self.delete(&format!("/v2/orders/{order_id}")).await
     }
 
@@ -48,6 +50,7 @@ impl DhanClient {
     ///
     /// **Endpoint:** `GET /v2/orders/{order-id}`
     pub async fn get_order(&self, order_id: &str) -> Result<OrderDetail> {
+        let order_id = required_path_segment("order_id", order_id)?;
         self.get(&format!("/v2/orders/{order_id}")).await
     }
 
@@ -55,6 +58,7 @@ impl DhanClient {
     ///
     /// **Endpoint:** `GET /v2/orders/external/{correlation-id}`
     pub async fn get_order_by_correlation_id(&self, correlation_id: &str) -> Result<OrderDetail> {
+        let correlation_id = required_path_segment("correlation_id", correlation_id)?;
         self.get(&format!("/v2/orders/external/{correlation_id}"))
             .await
     }
@@ -70,6 +74,7 @@ impl DhanClient {
     ///
     /// **Endpoint:** `GET /v2/trades/{order-id}`
     pub async fn get_trades_for_order(&self, order_id: &str) -> Result<Vec<TradeDetail>> {
+        let order_id = required_path_segment("order_id", order_id)?;
         self.get(&format!("/v2/trades/{order_id}")).await
     }
 }

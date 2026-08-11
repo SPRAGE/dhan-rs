@@ -1,0 +1,25 @@
+version: 1
+name: frontend-design
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, implement, test, review.code]
+budgets:
+  entry_tokens: 650
+  total_tokens: 700
+references: []
+package:
+  - SKILL.md
+  - manifest.yaml
+triggers:
+  positive:
+    - Design a polished settings page for this application.
+    - Refine this component's visual hierarchy and interactions.
+    - Build an accessible responsive landing page.
+    - Make this existing frontend feel intentional and production ready.
+    - Implement the dashboard UI from these requirements.
+  negative:
+    - Fix the API pagination bug.
+    - Explain how this reducer works.
+    - Change one button label.
+    - Upgrade the CSS compiler dependency.
+    - Review a database migration.

@@ -1,0 +1,23 @@
+version: 1
+name: knowledge-integration
+managed_by: dev-template
+audience: optional
+requires_capabilities: [research, plan, implement, test, review.security]
+budgets:
+  entry_tokens: 700
+  total_tokens: 2600
+references: [references/source-registry.md, references/retrieval-quality.md]
+package: [SKILL.md, manifest.yaml, references/*.md]
+triggers:
+  positive:
+    - Connect this project to its documentation knowledge base safely.
+    - Design retrieval with citations, freshness, and tenant isolation.
+    - Evaluate whether our search results actually ground answers.
+    - Add an ingestion and deletion contract for these knowledge sources.
+    - Query the configured knowledge system for domain rules before planning.
+  negative:
+    - Search this repository for a function name.
+    - Explain a document already provided in the prompt.
+    - Add a static FAQ page.
+    - Change a database column unrelated to retrieval.
+    - Enable an unspecified external service automatically.

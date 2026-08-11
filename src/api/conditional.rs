@@ -1,10 +1,19 @@
 //! Conditional Trigger endpoints.
 
-use crate::client::DhanClient;
-use crate::error::Result;
+use crate::client::{DhanClient, required_path_segment};
+use crate::error::{DhanError, Result};
 use crate::types::conditional::*;
 
 impl DhanClient {
+    /// Place multiple orders without an alert condition.
+    ///
+    /// **Endpoint:** `POST /v2/alerts/multi/orders`
+    pub async fn place_multi_order(&self, req: &MultiOrderRequest) -> Result<MultiOrderResponse> {
+        req.validate()
+            .map_err(|message| DhanError::InvalidArgument(message.into()))?;
+        self.post("/v2/alerts/multi/orders", req).await
+    }
+
     /// Place a new conditional trigger.
     ///
     /// **Endpoint:** `POST /v2/alerts/orders`
@@ -23,6 +32,7 @@ impl DhanClient {
         alert_id: &str,
         req: &ConditionalTriggerRequest,
     ) -> Result<ConditionalTriggerResponse> {
+        let alert_id = required_path_segment("alert_id", alert_id)?;
         self.put(&format!("/v2/alerts/orders/{alert_id}"), req)
             .await
     }
@@ -34,6 +44,7 @@ impl DhanClient {
         &self,
         alert_id: &str,
     ) -> Result<ConditionalTriggerResponse> {
+        let alert_id = required_path_segment("alert_id", alert_id)?;
         self.delete(&format!("/v2/alerts/orders/{alert_id}")).await
     }
 
@@ -44,6 +55,7 @@ impl DhanClient {
         &self,
         alert_id: &str,
     ) -> Result<ConditionalTriggerDetail> {
+        let alert_id = required_path_segment("alert_id", alert_id)?;
         self.get(&format!("/v2/alerts/orders/{alert_id}")).await
     }
 

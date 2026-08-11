@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git ls-files:*)",
+      "Bash(nix flake check:*)",
+      "Bash(nix flake show:*)",
+      "Bash(nix eval:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt --check:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv lock --check:*)"
+    ],
+    "deny": [
+      "Edit(//.env)",
+      "Edit(//.env.*)",
+      "Read(//.env)",
+      "Read(//.env.*)",
+      "Edit(//.git/**)"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": ".claude/hooks/statusline.sh"
+  }
+}

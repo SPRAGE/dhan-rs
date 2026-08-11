@@ -23,12 +23,18 @@ pub struct Holding {
     pub dp_qty: Option<i64>,
     #[serde(default)]
     pub t1_qty: Option<i64>,
+    #[serde(default, rename = "mtf_t1_qty", alias = "mtfT1Qty")]
+    pub mtf_t1_qty: Option<i64>,
+    #[serde(default, rename = "mtf_qty", alias = "mtfQty")]
+    pub mtf_qty: Option<i64>,
     #[serde(default)]
     pub available_qty: Option<i64>,
     #[serde(default)]
     pub collateral_qty: Option<i64>,
     #[serde(default)]
     pub avg_cost_price: Option<f64>,
+    #[serde(default)]
+    pub last_traded_price: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

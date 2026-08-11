@@ -1,0 +1,23 @@
+version: 1
+name: api-contracts
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, plan, implement, test, review.security]
+budgets:
+  entry_tokens: 650
+  total_tokens: 850
+references: []
+package: [SKILL.md, manifest.yaml]
+triggers:
+  positive:
+    - Design a stable public API for these dashboard queries.
+    - Evolve this endpoint without breaking existing consumers.
+    - Define idempotency, retries, and concurrency for this mutation.
+    - Review pagination and error semantics across these services.
+    - Add behavioral contract tests for old and new clients.
+  negative:
+    - Call an existing endpoint from one component.
+    - Rename a private helper.
+    - Fix a database query behind an unchanged contract.
+    - Generate documentation from an already settled schema.
+    - Add one internal function parameter.

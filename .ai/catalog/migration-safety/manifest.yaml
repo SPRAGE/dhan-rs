@@ -1,0 +1,23 @@
+version: 1
+name: migration-safety
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, plan, implement, test, review.security]
+budgets:
+  entry_tokens: 700
+  total_tokens: 1400
+references: [references/staged-migration.md]
+package: [SKILL.md, manifest.yaml, references/*.md]
+triggers:
+  positive:
+    - Plan a zero-downtime schema and data migration.
+    - Backfill this field safely across millions of records.
+    - Migrate clients between incompatible protocol versions.
+    - Design rollout, stop gates, and rollback for this configuration change.
+    - Review whether old consumers can survive the migration sequence.
+  negative:
+    - Add a nullable column in an unused local database.
+    - Rename a test fixture.
+    - Explain the current schema.
+    - Generate a fresh development database.
+    - Delete production data immediately without a migration plan.

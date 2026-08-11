@@ -19,13 +19,16 @@
 //!
 //! ## Overview
 //!
-//! `dhan-rs` provides a complete, strongly-typed async Rust client for all
-//! DhanHQ v2 REST endpoints and WebSocket streams:
+//! `dhan-rs` provides a broad, strongly-typed async Rust client for documented
+//! DhanHQ v2 REST endpoints and WebSocket protocols. Dhan's HTML and linked
+//! OpenAPI sources contain conflicts, and live authenticated compatibility is
+//! not certified:
 //!
-//! - **55+ REST API methods** covering orders, portfolio, market data,
-//!   historical data, option chains, funds, statements, and more
-//! - **Live Market Feed** via WebSocket with zero-copy binary packet parsing
-//! - **Live Order Updates** via WebSocket with JSON message streaming
+//! - **80 REST API methods** covering orders, portfolio, Data APIs, Global
+//!   Stocks, instruments, historical data, option chains, funds, and more
+//! - **Live Market Feed** with a low-level stream and supervised manager
+//! - **Live Order Updates** with low-level and managed/reconciling APIs
+//! - **Separate 20-level and 200-level Full Market Depth streams**
 //! - **Rich error handling** with [`DhanError`] covering API errors, HTTP
 //!   errors, JSON deserialization errors, and WebSocket errors
 //!
@@ -121,12 +124,13 @@
 //! - [`constants`] — Base URLs, WebSocket URLs, rate limit values
 //! - [`types`] — Request/response structs and shared enums
 //! - [`api`] — REST endpoint implementations (methods on `DhanClient`)
-//! - [`ws`] — WebSocket streaming (market feed + order updates)
+//! - [`ws`] — Standard feed, order updates, and Full Market Depth streaming
 //!
 //! ## Feature Flags
 //!
-//! This crate currently has no optional feature flags. All functionality is
-//! included by default.
+//! The optional `cli` feature enables the `ws_check` diagnostic binary and its
+//! `tracing-subscriber` dependency. Library functionality is available by
+//! default.
 
 #![warn(missing_docs)]
 #![allow(clippy::doc_markdown)]

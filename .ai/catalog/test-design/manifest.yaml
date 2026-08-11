@@ -1,0 +1,23 @@
+version: 1
+name: test-design
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, plan, implement, test, review.code]
+budgets:
+  entry_tokens: 650
+  total_tokens: 850
+references: []
+package: [SKILL.md, manifest.yaml]
+triggers:
+  positive:
+    - Design the verification strategy for this complex feature.
+    - Decide which invariants need property or contract tests.
+    - Reduce this slow redundant test suite without losing risk coverage.
+    - Add concurrency, recovery, and failure-path coverage for this service.
+    - Review the test plan against the system's actual failure modes.
+  negative:
+    - Run an existing focused test.
+    - Fix one obvious stale assertion.
+    - Format the test directory.
+    - Explain what a unit test is.
+    - Increase coverage percentage without a risk model.

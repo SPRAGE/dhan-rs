@@ -24,6 +24,20 @@
 
 use serde::Deserialize;
 
+/// Reason a deserialized postback is not a minimally usable order update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PostbackValidationError {
+    /// The payload has no non-blank Dhan client identity.
+    #[error("postback dhan_client_id is required")]
+    MissingClientId,
+    /// The payload has no non-blank order identity.
+    #[error("postback order_id is required")]
+    MissingOrderId,
+    /// The payload has no non-blank order status.
+    #[error("postback order_status is required")]
+    MissingOrderStatus,
+}
+
 /// Postback (webhook) payload sent by Dhan to your configured Postback URL.
 ///
 /// The JSON body is a raw `POST` request containing the order update. Fields
@@ -137,6 +151,36 @@ pub struct PostbackPayload {
 }
 
 impl PostbackPayload {
+    /// Validate the minimum identity and state fields required to process an
+    /// order update safely.
+    ///
+    /// Deserialization intentionally remains permissive for compatibility;
+    /// webhook receivers should call this before acting on a payload.
+    pub fn validate(&self) -> Result<(), PostbackValidationError> {
+        if self
+            .dhan_client_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(PostbackValidationError::MissingClientId);
+        }
+        if self
+            .order_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(PostbackValidationError::MissingOrderId);
+        }
+        if self
+            .order_status
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(PostbackValidationError::MissingOrderStatus);
+        }
+        Ok(())
+    }
+
     /// Returns `true` if this payload represents a fully traded order.
     pub fn is_traded(&self) -> bool {
         self.order_status.as_deref() == Some("TRADED")

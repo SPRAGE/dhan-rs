@@ -1,0 +1,28 @@
+version: 1
+name: agent-context
+managed_by: dev-template
+audience: default
+requires_capabilities: [explore, plan, implement, test]
+budgets:
+  entry_tokens: 700
+  total_tokens: 1800
+references:
+  - references/guidance-quality.md
+  - references/connectors.md
+package:
+  - SKILL.md
+  - manifest.yaml
+  - references/*.md
+triggers:
+  positive:
+    - Set up agent guidance for this repository.
+    - Audit our repository context for stale instructions.
+    - Refresh the shared AI configuration without losing local settings.
+    - Reduce the token cost of our agent guidance.
+    - Recommend useful agent tools and context routes.
+  negative:
+    - Fix the failing parser test.
+    - Explain this function.
+    - Review the current pull request.
+    - Build a dashboard page.
+    - Upgrade the database dependency.

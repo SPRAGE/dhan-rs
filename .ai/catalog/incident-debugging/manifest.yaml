@@ -1,0 +1,23 @@
+version: 1
+name: incident-debugging
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, research, plan, implement, test]
+budgets:
+  entry_tokens: 650
+  total_tokens: 850
+references: []
+package: [SKILL.md, manifest.yaml]
+triggers:
+  positive:
+    - Diagnose this intermittent production outage from telemetry.
+    - Build a hypothesis-led investigation for the latency regression.
+    - Reproduce and fix this failure that appears only under load.
+    - Correlate deploys, traces, and data changes into an incident timeline.
+    - Write an evidence-backed post-incident explanation and regression guard.
+  negative:
+    - Fix a deterministic failing unit test.
+    - Explain a known compiler error.
+    - Add logging to a new feature.
+    - Review a planned architecture before release.
+    - Restart production immediately without authorization.

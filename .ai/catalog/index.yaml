@@ -1,0 +1,42 @@
+version: 1
+selection:
+  consult_when: Planned or Hard work needs uncovered specialist guidance.
+  load_limit: 2
+  activate_when: The procedure will recur; otherwise load it only for the task.
+skills:
+  agent-evaluation:
+    use_when: Measuring whether agent guidance or tools improve outcomes.
+    avoid_when: Running ordinary tests or a one-off review.
+  api-contracts:
+    use_when: Designing or compatibly evolving a service boundary.
+    avoid_when: Consuming a settled internal contract.
+  data-visualization:
+    use_when: Chart meaning, uncertainty, or data interaction matters.
+    avoid_when: General page styling without analytical data.
+  domain-modeling:
+    use_when: Unfamiliar rules, workflows, states, or boundaries affect design.
+    avoid_when: Domain behavior is already settled and evidenced.
+  frontend-design:
+    use_when: Interface hierarchy, interaction, responsiveness, and polish matter.
+    avoid_when: A non-visual backend or mechanical UI change.
+  incident-debugging:
+    use_when: Production, intermittent, or telemetry-dependent failure needs investigation.
+    avoid_when: A local defect has an obvious reproduction.
+  interactive-playground:
+    use_when: The requested deliverable is a standalone interactive decision tool.
+    avoid_when: The user wants the final product implementation directly.
+  knowledge-integration:
+    use_when: Configured knowledge retrieval, ingestion, citations, or quality is material.
+    avoid_when: Repository or supplied context already answers it.
+  migration-safety:
+    use_when: Data, schema, protocol, or configuration states must coexist safely.
+    avoid_when: A disposable local change has no compatibility or recovery risk.
+  performance-engineering:
+    use_when: Latency, throughput, memory, rendering, or resource budgets must be measured.
+    avoid_when: No performance outcome or reproducible workload exists.
+  skill-authoring:
+    use_when: Creating, validating, packaging, or evaluating a reusable skill.
+    avoid_when: Following an existing procedure once.
+  test-design:
+    use_when: A complex change needs a risk-based multi-layer verification strategy.
+    avoid_when: Running or repairing one obvious existing test.

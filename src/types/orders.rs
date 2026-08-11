@@ -116,6 +116,7 @@ pub struct OrderResponse {
 pub struct OrderDetail {
     pub dhan_client_id: Option<String>,
     pub order_id: Option<String>,
+    pub exchange_order_id: Option<String>,
     pub correlation_id: Option<String>,
     pub order_status: Option<String>,
     pub transaction_type: Option<String>,
@@ -175,6 +176,7 @@ pub struct TradeDetail {
     pub product_type: Option<String>,
     pub order_type: Option<String>,
     pub trading_symbol: Option<String>,
+    pub custom_symbol: Option<String>,
     pub security_id: Option<String>,
     #[serde(default)]
     pub traded_quantity: Option<u64>,

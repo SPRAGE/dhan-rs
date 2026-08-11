@@ -6,7 +6,7 @@
 use reqwest::header::HeaderValue;
 use serde_json::Value;
 
-use crate::client::DhanClient;
+use crate::client::{DhanClient, required_query_value};
 use crate::constants::AUTH_BASE_URL;
 use crate::error::{ApiErrorBody, DhanError, Result};
 use crate::types::auth::{AppConsentResponse, PartnerConsentResponse, TokenResponse};
@@ -45,18 +45,31 @@ impl DhanClient {
         pin: &str,
         totp: &str,
     ) -> Result<TokenResponse> {
+        let client_id = required_query_value("client_id", client_id)?;
+        let pin = required_query_value("pin", pin)?;
+        let totp = required_query_value("totp", totp)?;
         let url = format!(
             "{}/app/generateAccessToken?dhanClientId={}&pin={}&totp={}",
             AUTH_BASE_URL, client_id, pin, totp
         );
 
-        tracing::debug!(%url, "POST generate_access_token");
+        tracing::debug!("POST generate_access_token");
 
-        let http = reqwest::Client::new();
-        let resp = http.post(&url).send().await?;
+        let http = auth_http_client()?;
+        let resp = http
+            .post(&url)
+            .send()
+            .await
+            .map_err(sanitize_auth_http_error)?;
 
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .map_err(|source| DhanError::ResponseBody {
+                status,
+                source: source.without_url(),
+            })?;
 
         if status.is_success() {
             serde_json::from_str(&body).map_err(DhanError::Json)
@@ -89,25 +102,37 @@ impl DhanClient {
     pub async fn renew_token(&mut self) -> Result<TokenResponse> {
         let url = format!("{}/v2/RenewToken", self.base_url());
 
-        tracing::debug!(%url, "GET renew_token");
+        tracing::debug!("GET renew_token");
+
+        let mut access_token = HeaderValue::from_str(self.access_token())?;
+        access_token.set_sensitive(true);
+        let mut client_id = HeaderValue::from_str(self.client_id())?;
+        client_id.set_sensitive(true);
 
         let resp = self
             .http()
             .get(&url)
-            .header("access-token", self.access_token())
-            .header("dhanClientId", self.client_id())
+            .header("access-token", access_token)
+            .header("dhanClientId", client_id)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(sanitize_auth_http_error)?;
 
         let status = resp.status();
-        let bytes = resp.bytes().await.unwrap_or_default();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|source| DhanError::ResponseBody {
+                status,
+                source: source.without_url(),
+            })?;
 
         if status.is_success() {
             let token: TokenResponse = serde_json::from_slice(&bytes).map_err(DhanError::Json)?;
             // Update the client's token so subsequent calls use the new one.
-            self.set_access_token(&token.access_token);
+            self.try_set_access_token(&token.access_token)?;
             Ok(token)
         } else {
             let body = String::from_utf8_lossy(&bytes);
@@ -132,33 +157,31 @@ impl DhanClient {
         app_id: &str,
         app_secret: &str,
     ) -> Result<AppConsentResponse> {
+        let client_id = required_query_value("client_id", client_id)?;
         let url = format!(
             "{}/app/generate-consent?client_id={}",
             AUTH_BASE_URL, client_id
         );
 
-        tracing::debug!(%url, "POST generate_consent");
+        tracing::debug!("POST generate_consent");
 
-        let http = reqwest::Client::new();
+        let http = auth_http_client()?;
         let resp = http
             .post(&url)
-            .header(
-                "app_id",
-                HeaderValue::from_str(app_id).map_err(|_| {
-                    DhanError::InvalidArgument("app_id contains invalid characters".into())
-                })?,
-            )
-            .header(
-                "app_secret",
-                HeaderValue::from_str(app_secret).map_err(|_| {
-                    DhanError::InvalidArgument("app_secret contains invalid characters".into())
-                })?,
-            )
+            .header("app_id", sensitive_header_value(app_id)?)
+            .header("app_secret", sensitive_header_value(app_secret)?)
             .send()
-            .await?;
+            .await
+            .map_err(sanitize_auth_http_error)?;
 
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .map_err(|source| DhanError::ResponseBody {
+                status,
+                source: source.without_url(),
+            })?;
 
         if status.is_success() {
             serde_json::from_str(&body).map_err(DhanError::Json)
@@ -179,6 +202,8 @@ impl DhanClient {
     /// // → "https://auth.dhan.co/login/consentApp-login?consentAppId=940b0ca1-..."
     /// ```
     pub fn consent_login_url(consent_app_id: &str) -> String {
+        let consent_app_id =
+            url::form_urlencoded::byte_serialize(consent_app_id.as_bytes()).collect::<String>();
         format!(
             "{}/login/consentApp-login?consentAppId={}",
             AUTH_BASE_URL, consent_app_id
@@ -196,33 +221,31 @@ impl DhanClient {
         app_id: &str,
         app_secret: &str,
     ) -> Result<TokenResponse> {
+        let token_id = required_query_value("token_id", token_id)?;
         let url = format!(
             "{}/app/consumeApp-consent?tokenId={}",
             AUTH_BASE_URL, token_id
         );
 
-        tracing::debug!(%url, "POST consume_consent");
+        tracing::debug!("POST consume_consent");
 
-        let http = reqwest::Client::new();
+        let http = auth_http_client()?;
         let resp = http
             .post(&url)
-            .header(
-                "app_id",
-                HeaderValue::from_str(app_id).map_err(|_| {
-                    DhanError::InvalidArgument("app_id contains invalid characters".into())
-                })?,
-            )
-            .header(
-                "app_secret",
-                HeaderValue::from_str(app_secret).map_err(|_| {
-                    DhanError::InvalidArgument("app_secret contains invalid characters".into())
-                })?,
-            )
+            .header("app_id", sensitive_header_value(app_id)?)
+            .header("app_secret", sensitive_header_value(app_secret)?)
             .send()
-            .await?;
+            .await
+            .map_err(sanitize_auth_http_error)?;
 
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .map_err(|source| DhanError::ResponseBody {
+                status,
+                source: source.without_url(),
+            })?;
 
         if status.is_success() {
             serde_json::from_str(&body).map_err(DhanError::Json)
@@ -244,28 +267,25 @@ impl DhanClient {
     ) -> Result<PartnerConsentResponse> {
         let url = format!("{}/partner/generate-consent", AUTH_BASE_URL);
 
-        tracing::debug!(%url, "POST partner_generate_consent");
+        tracing::debug!("POST partner_generate_consent");
 
-        let http = reqwest::Client::new();
+        let http = auth_http_client()?;
         let resp = http
             .post(&url)
-            .header(
-                "partner_id",
-                HeaderValue::from_str(partner_id).map_err(|_| {
-                    DhanError::InvalidArgument("partner_id contains invalid characters".into())
-                })?,
-            )
-            .header(
-                "partner_secret",
-                HeaderValue::from_str(partner_secret).map_err(|_| {
-                    DhanError::InvalidArgument("partner_secret contains invalid characters".into())
-                })?,
-            )
+            .header("partner_id", sensitive_header_value(partner_id)?)
+            .header("partner_secret", sensitive_header_value(partner_secret)?)
             .send()
-            .await?;
+            .await
+            .map_err(sanitize_auth_http_error)?;
 
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .map_err(|source| DhanError::ResponseBody {
+                status,
+                source: source.without_url(),
+            })?;
 
         if status.is_success() {
             serde_json::from_str(&body).map_err(DhanError::Json)
@@ -279,7 +299,9 @@ impl DhanClient {
     /// Open this URL in a browser. After the user authenticates, they will be
     /// redirected with a `tokenId` query parameter.
     pub fn partner_consent_login_url(consent_id: &str) -> String {
-        format!("{}/consent-login?consentId={}", AUTH_BASE_URL, consent_id)
+        let consent_id =
+            url::form_urlencoded::byte_serialize(consent_id.as_bytes()).collect::<String>();
+        format!("{}/consent-login?consentId={consent_id}", AUTH_BASE_URL)
     }
 
     /// **Step 3 (Partner):** Consume the partner consent to obtain an access token.
@@ -290,33 +312,31 @@ impl DhanClient {
         partner_id: &str,
         partner_secret: &str,
     ) -> Result<TokenResponse> {
+        let token_id = required_query_value("token_id", token_id)?;
         let url = format!(
             "{}/partner/consume-consent?tokenId={}",
             AUTH_BASE_URL, token_id
         );
 
-        tracing::debug!(%url, "POST partner_consume_consent");
+        tracing::debug!("POST partner_consume_consent");
 
-        let http = reqwest::Client::new();
+        let http = auth_http_client()?;
         let resp = http
             .post(&url)
-            .header(
-                "partner_id",
-                HeaderValue::from_str(partner_id).map_err(|_| {
-                    DhanError::InvalidArgument("partner_id contains invalid characters".into())
-                })?,
-            )
-            .header(
-                "partner_secret",
-                HeaderValue::from_str(partner_secret).map_err(|_| {
-                    DhanError::InvalidArgument("partner_secret contains invalid characters".into())
-                })?,
-            )
+            .header("partner_id", sensitive_header_value(partner_id)?)
+            .header("partner_secret", sensitive_header_value(partner_secret)?)
             .send()
-            .await?;
+            .await
+            .map_err(sanitize_auth_http_error)?;
 
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .map_err(|source| DhanError::ResponseBody {
+                status,
+                source: source.without_url(),
+            })?;
 
         if status.is_success() {
             serde_json::from_str(&body).map_err(DhanError::Json)
@@ -349,5 +369,49 @@ impl DhanClient {
             status,
             body: body.to_owned(),
         })
+    }
+}
+
+fn sensitive_header_value(value: &str) -> Result<HeaderValue> {
+    let mut value = HeaderValue::from_str(value)?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+fn auth_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(DhanError::Http)
+}
+
+fn sanitize_auth_http_error(error: reqwest::Error) -> DhanError {
+    DhanError::Http(error.without_url())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_auth_http_error;
+
+    #[tokio::test]
+    async fn auth_transport_errors_do_not_retain_sensitive_urls() {
+        let pin = "1234";
+        let totp = "654321";
+        let token_id = "sensitive-consent-token";
+        let url = format!(
+            "ftp://127.0.0.1/app/generateAccessToken?dhanClientId=1&pin={pin}&totp={totp}&tokenId={token_id}"
+        );
+        let error = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect_err("reqwest must reject the unsupported URL scheme");
+        let error = sanitize_auth_http_error(error);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        for secret in [pin, totp, token_id] {
+            assert!(!display.contains(secret));
+            assert!(!debug.contains(secret));
+        }
     }
 }

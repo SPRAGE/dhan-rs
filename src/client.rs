@@ -14,11 +14,55 @@ use serde::de::DeserializeOwned;
 use crate::constants::API_BASE_URL;
 use crate::error::{ApiErrorBody, DhanError, Result};
 
+/// Validate a required dynamic path component and encode it as one URL path
+/// segment.  Callers must use this rather than interpolating user input into a
+/// route: an order ID such as `a/b` is an ID, not two path segments.
+pub(crate) fn required_path_segment(name: &str, value: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(DhanError::InvalidArgument(format!(
+            "{name} must not be empty"
+        )));
+    }
+    // `byte_serialize` leaves RFC 3986 unreserved characters alone. A whole
+    // dot segment is special to URL parsers, so reject it rather than relying
+    // on percent-encoding that a parser might normalize before transmission.
+    if matches!(value, "." | "..") {
+        return Err(DhanError::InvalidArgument(format!(
+            "{name} must not be a path-navigation segment"
+        )));
+    }
+    Ok(percent_encode_component(value))
+}
+
+/// Validate and percent-encode a required query value.
+///
+/// This uses percent encoding rather than form `+` escaping so generated
+/// routes remain unambiguous in logs, proxies, and request-target tests.
+pub(crate) fn required_query_value(name: &str, value: &str) -> Result<String> {
+    required_path_segment(name, value)
+}
+
+/// Percent-encode a URL component without applying HTML-form `+` escaping.
+fn percent_encode_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
+}
+
 /// Core HTTP client for the DhanHQ REST API v2.
 ///
 /// Wraps [`reqwest::Client`] and injects the required authentication headers
-/// into every request. Auth header values are cached at construction time to
-/// avoid per-request allocation.
+/// into every request. Header values are validated at request time so public
+/// credential input cannot panic during client construction or token rotation.
 ///
 /// # Example
 ///
@@ -32,7 +76,7 @@ use crate::error::{ApiErrorBody, DhanError, Result};
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DhanClient {
     http: reqwest::Client,
     /// The Dhan client ID (user-specific identification).
@@ -41,9 +85,16 @@ pub struct DhanClient {
     access_token: String,
     /// Base URL for REST API requests (defaults to [`API_BASE_URL`]).
     base_url: String,
-    /// Pre-built auth header values, cached to avoid per-request allocation.
-    auth_header_token: HeaderValue,
-    auth_header_client_id: HeaderValue,
+}
+
+impl std::fmt::Debug for DhanClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhanClient")
+            .field("client_id", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DhanClient {
@@ -62,26 +113,57 @@ impl DhanClient {
         access_token: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        let client_id = client_id.into();
+        let access_token = access_token.into();
+        let base_url = base_url.into();
+        Self::try_with_base_url(client_id.clone(), access_token.clone(), base_url.clone())
+            .unwrap_or_else(|_| {
+                // Keep the established infallible constructor source-compatible.
+                // Invalid credentials are converted to typed errors when a request
+                // is attempted, rather than panicking during construction.
+                Self::with_unchecked_credentials(client_id, access_token, base_url)
+            })
+    }
+
+    /// Fallible variant of [`Self::new`] that validates credential header
+    /// values at construction time.
+    pub fn try_new(client_id: impl Into<String>, access_token: impl Into<String>) -> Result<Self> {
+        Self::try_with_base_url(client_id, access_token, API_BASE_URL)
+    }
+
+    /// Fallible variant of [`Self::with_base_url`] that validates credential
+    /// header values at construction time.
+    pub fn try_with_base_url(
+        client_id: impl Into<String>,
+        access_token: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Result<Self> {
+        let client_id = client_id.into();
+        let access_token = access_token.into();
+        Self::validate_credentials(&client_id, &access_token)?;
+        Ok(Self::with_unchecked_credentials(
+            client_id,
+            access_token,
+            base_url.into(),
+        ))
+    }
+
+    fn with_unchecked_credentials(
+        client_id: String,
+        access_token: String,
+        base_url: String,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .default_headers(Self::default_headers())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build reqwest client");
-
-        let access_token = access_token.into();
-        let client_id = client_id.into();
-
-        let auth_header_token = HeaderValue::from_str(&access_token)
-            .expect("access token contains invalid header characters");
-        let auth_header_client_id = HeaderValue::from_str(&client_id)
-            .expect("client id contains invalid header characters");
 
         Self {
             http,
             client_id,
             access_token,
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            auth_header_token,
-            auth_header_client_id,
+            base_url: base_url.trim_end_matches('/').to_owned(),
         }
     }
 
@@ -103,8 +185,15 @@ impl DhanClient {
     /// Replace the access token (e.g. after renewal).
     pub fn set_access_token(&mut self, token: impl Into<String>) {
         self.access_token = token.into();
-        self.auth_header_token = HeaderValue::from_str(&self.access_token)
-            .expect("access token contains invalid header characters");
+    }
+
+    /// Validate and replace the access token without deferring invalid-header
+    /// errors to a later request.
+    pub fn try_set_access_token(&mut self, token: impl Into<String>) -> Result<()> {
+        let token = token.into();
+        HeaderValue::from_str(&token)?;
+        self.access_token = token;
+        Ok(())
     }
 
     /// Returns the base URL.
@@ -124,7 +213,7 @@ impl DhanClient {
         let resp = self
             .http
             .get(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -139,8 +228,24 @@ impl DhanClient {
         let resp = self
             .http
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .json(body)
+            .send()
+            .await?;
+
+        self.handle_response(resp).await
+    }
+
+    /// Perform a POST request without a request body and deserialize the
+    /// successful JSON response.
+    pub async fn post_without_body<R: DeserializeOwned>(&self, path: &str) -> Result<R> {
+        let url = self.url(path);
+        tracing::debug!(%url, "POST");
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -155,7 +260,7 @@ impl DhanClient {
         let resp = self
             .http
             .put(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .json(body)
             .send()
             .await?;
@@ -171,7 +276,7 @@ impl DhanClient {
         let resp = self
             .http
             .delete(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -186,7 +291,7 @@ impl DhanClient {
         let resp = self
             .http
             .delete(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -194,7 +299,10 @@ impl DhanClient {
         if status.is_success() {
             Ok(())
         } else {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .map_err(|source| DhanError::ResponseBody { status, source })?;
             Err(self.parse_error_body(status, &body))
         }
     }
@@ -207,7 +315,7 @@ impl DhanClient {
         let resp = self
             .http
             .get(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .send()
             .await?;
 
@@ -215,7 +323,10 @@ impl DhanClient {
         if status.is_success() {
             Ok(())
         } else {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .map_err(|source| DhanError::ResponseBody { status, source })?;
             Err(self.parse_error_body(status, &body))
         }
     }
@@ -228,7 +339,7 @@ impl DhanClient {
         let resp = self
             .http
             .post(&url)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .json(body)
             .send()
             .await?;
@@ -237,7 +348,10 @@ impl DhanClient {
         if status.is_success() {
             Ok(())
         } else {
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .map_err(|source| DhanError::ResponseBody { status, source })?;
             Err(self.parse_error_body(status, &body))
         }
     }
@@ -266,13 +380,23 @@ impl DhanClient {
         headers
     }
 
-    /// Per-request auth headers. Uses cached [`HeaderValue`]s — only the
-    /// [`HeaderMap`] container is allocated per call (no string parsing).
-    fn auth_headers(&self) -> HeaderMap {
+    /// Per-request auth headers. Credentials are validated here so legacy
+    /// infallible constructors cannot panic on public input.
+    fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::with_capacity(2);
-        headers.insert("access-token", self.auth_header_token.clone());
-        headers.insert("client-id", self.auth_header_client_id.clone());
-        headers
+        let mut token = HeaderValue::from_str(&self.access_token)?;
+        token.set_sensitive(true);
+        let mut client_id = HeaderValue::from_str(&self.client_id)?;
+        client_id.set_sensitive(true);
+        headers.insert("access-token", token);
+        headers.insert("client-id", client_id);
+        Ok(headers)
+    }
+
+    fn validate_credentials(client_id: &str, access_token: &str) -> Result<()> {
+        HeaderValue::from_str(client_id)?;
+        HeaderValue::from_str(access_token)?;
+        Ok(())
     }
 
     /// Read a response, returning either the deserialized body or a `DhanError`.
@@ -281,7 +405,10 @@ impl DhanClient {
     /// UTF-8 validation that `text()` + `from_str()` would incur.
     async fn handle_response<R: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<R> {
         let status = resp.status();
-        let bytes = resp.bytes().await.unwrap_or_default();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|source| DhanError::ResponseBody { status, source })?;
 
         if status.is_success() {
             serde_json::from_slice(&bytes).map_err(DhanError::Json)

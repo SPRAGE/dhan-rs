@@ -1,0 +1,23 @@
+version: 1
+name: domain-modeling
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, research, plan, document]
+budgets:
+  entry_tokens: 650
+  total_tokens: 850
+references: []
+package: [SKILL.md, manifest.yaml]
+triggers:
+  positive:
+    - Model this unfamiliar business domain before we choose the architecture.
+    - Derive the actors, workflows, states, and invariants for this feature.
+    - Build a glossary and bounded context from the repository and product notes.
+    - Reconcile these conflicting business rules before implementation.
+    - Turn the domain requirements into testable examples and boundaries.
+  negative:
+    - Rename this local variable.
+    - Run the existing unit tests.
+    - Explain a well-documented helper function.
+    - Upgrade a patch dependency.
+    - Format the current file.

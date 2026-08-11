@@ -1,0 +1,24 @@
+version: 2
+project:
+  name: PROJECTNAME
+  summary: TODO replace with a one-line Rust project description.
+context:
+  always: [AI.md, .ai/instructions.md]
+  conditional:
+    architecture: .ai/context/architecture-snapshot.md
+    conventions: .ai/context/conventions.md
+    decisions: .ai/context/decisions.md
+    active: .ai/context/active-context.md
+    knowledge: .ai/context/knowledge-sources.yaml
+spec:
+  policy: .ai/policy.yaml
+  contract_evals: .ai/evals/contract-scenarios.yaml
+budgets:
+  always_loaded_tokens: 1100
+  planned_route_tokens: 1800
+  adapter_tokens: 300
+  skill_descriptions_tokens: 150
+  skill_entry_tokens: 700
+  agent_catalog_tokens: 300
+  agent_contract_tokens: 375
+  optional_skill_catalog_tokens: 600

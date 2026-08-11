@@ -26,6 +26,9 @@ pub enum ExchangeSegment {
     BSE_EQ,
     /// MCX Commodity (segment code 5).
     MCX_COMM,
+    /// NSE Commodity. The linked REST OpenAPI publishes this value, but Dhan's
+    /// binary-feed annexure does not assign it a segment code.
+    NSE_COMM,
     /// BSE Currency (segment code 7).
     BSE_CURRENCY,
     /// BSE Futures & Options (segment code 8).
@@ -33,17 +36,19 @@ pub enum ExchangeSegment {
 }
 
 impl ExchangeSegment {
-    /// Returns the numeric segment code used in binary WebSocket packets.
-    pub fn segment_code(self) -> u8 {
+    /// Returns the documented numeric segment code used in binary WebSocket
+    /// packets, or `None` for REST-only values such as `NSE_COMM`.
+    pub fn segment_code(self) -> Option<u8> {
         match self {
-            Self::IDX_I => 0,
-            Self::NSE_EQ => 1,
-            Self::NSE_FNO => 2,
-            Self::NSE_CURRENCY => 3,
-            Self::BSE_EQ => 4,
-            Self::MCX_COMM => 5,
-            Self::BSE_CURRENCY => 7,
-            Self::BSE_FNO => 8,
+            Self::IDX_I => Some(0),
+            Self::NSE_EQ => Some(1),
+            Self::NSE_FNO => Some(2),
+            Self::NSE_CURRENCY => Some(3),
+            Self::BSE_EQ => Some(4),
+            Self::MCX_COMM => Some(5),
+            Self::NSE_COMM => None,
+            Self::BSE_CURRENCY => Some(7),
+            Self::BSE_FNO => Some(8),
         }
     }
 

@@ -21,16 +21,22 @@
 //! - [`traders_control`] — Kill switch and P&L exit types
 //! - [`statements`] — Ledger and trade history types
 //! - [`postback`] — Webhook payload deserialization type
+//! - [`data`] — Rolling option, technical, mover, and company-data types
+//! - [`global_stocks`] — Global Stocks request and response types
+//! - [`instruments`] — Instrument-master segment types
 //!
 //! All enums are re-exported at the module root via `pub use enums::*`.
 
 pub mod auth;
 pub mod conditional;
+pub mod data;
 pub mod edis;
 pub mod enums;
 pub mod forever_order;
 pub mod funds;
+pub mod global_stocks;
 pub mod historical;
+pub mod instruments;
 pub mod market_quote;
 pub mod option_chain;
 pub mod orders;

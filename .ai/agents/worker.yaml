@@ -1,0 +1,15 @@
+version: 2
+name: worker
+mission: Implement one bounded change and prove it against explicit success criteria.
+when_to_use: An independent edit scope is ready and delegation reduces context or latency.
+avoid_when: The task is tightly coupled, trivial, unsafe, or missing a settled scope.
+capabilities: [implement, test, document]
+routing_role: implement
+profile: workspace_write
+model_tier: balanced
+output_contract: change_report
+write_scope: Assigned files and directly required tests or documentation.
+constraints:
+  - Preserve stated invariants and unrelated work.
+  - Stop on scope conflict, missing dependency, unsafe action, or contradicted assumption.
+  - Run focused verification; never weaken tests or remove behavior to pass.

@@ -1,0 +1,91 @@
+version: 2
+
+authorization:
+  inspect_intents: [explain, review, diagnose, plan]
+  change_intents: [change, build, fix]
+  inspect_action: inspect_and_report
+  change_action: edit_and_validate
+  confirm_before:
+    - destructive_action
+    - external_write
+    - purchase
+    - permission_expansion
+    - material_scope_expansion
+  question_trigger:
+    - material_choice
+    - irreversible_choice
+    - high_risk_choice
+
+repository_scope:
+  default_boundary: current_git_root
+  allow_cross_repository_when:
+    - explicit_external_path
+    - explicit_cross_repository_authorization
+  authorized_action: inspect_authorized_repository
+  absent_code_action: report_repository_boundary
+
+delivery:
+  direct:
+    when_all: [bounded_scope, reversible, low_risk, no_unresolved_dependency]
+    planner_tier: none
+    worker_tier: primary
+    review_tier: none
+  planned:
+    when_any:
+      - dependent_steps
+      - architecture_choice
+      - material_ambiguity
+      - cross_boundary_coordination
+    planner_tier: primary
+    worker_tier: balanced
+    review_tier: deep
+  hard:
+    when_any:
+      - security_sensitive
+      - destructive
+      - regulated
+      - data_migration
+      - broadly_ambiguous
+      - high_consequence
+    planner_tier: primary
+    worker_tier: balanced
+    review_tier: deep
+
+routing:
+  explore: fast
+  research: balanced
+  plan: deep
+  implement: balanced
+  test: balanced
+  document: balanced
+  integrate: deep
+  review: deep
+  risk_review: deep
+
+handoff:
+  required:
+    - objective
+    - file_scope
+    - success_criteria
+    - preserved_invariants
+    - required_evidence
+  stop_on:
+    - scope_conflict
+    - missing_dependency
+    - unsafe_action
+    - contradicted_assumption
+
+completion:
+  statuses: [complete, partial, blocked]
+  complete_requires: [evidence]
+  partial_requires: [blockers, next_action]
+  blocked_requires: [blockers, next_action]
+  preserve:
+    - user_provided_values
+    - unrelated_changes
+    - local_runtime_state
+    - existing_behavior_not_in_scope
+  prohibited_shortcuts:
+    - remove_behavior_to_make_checks_pass
+    - weaken_tests_to_hide_a_regression
+    - silently_expand_scope

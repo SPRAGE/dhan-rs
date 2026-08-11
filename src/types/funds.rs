@@ -1,7 +1,9 @@
 #![allow(missing_docs)]
 //! Funds & Margin types.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::types::enums::*;
 
@@ -74,27 +76,78 @@ pub struct MarginScript {
 pub struct MultiMarginRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_position: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "includeOrder", skip_serializing_if = "Option::is_none")]
     pub include_orders: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dhan_client_id: Option<String>,
-    #[serde(alias = "scripList")]
+    #[serde(rename = "scripList")]
     pub scripts: Vec<MarginScript>,
 }
 
 /// Response from multi-margin calculation.
 ///
-/// Note: field names use snake_case in the API response.
+/// Accepts both documented snake/camel names and numeric/string scalar
+/// variants while retaining the established string-valued public fields.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MultiMarginResponse {
+    #[serde(
+        default,
+        alias = "totalMargin",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub total_margin: Option<String>,
+    #[serde(
+        default,
+        alias = "spanMargin",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub span_margin: Option<String>,
+    #[serde(
+        default,
+        alias = "exposureMargin",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub exposure_margin: Option<String>,
+    #[serde(
+        default,
+        alias = "equityMargin",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub equity_margin: Option<String>,
+    #[serde(
+        default,
+        alias = "foMargin",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub fo_margin: Option<String>,
+    #[serde(
+        default,
+        alias = "commodityMargin",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub commodity_margin: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_scalar")]
     pub currency: Option<String>,
+    #[serde(
+        default,
+        alias = "hedgeBenefit",
+        deserialize_with = "deserialize_optional_scalar"
+    )]
     pub hedge_benefit: Option<String>,
+}
+
+fn deserialize_optional_scalar<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(other) => Err(D::Error::custom(format!(
+            "expected a string, number, or null, got {other}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------

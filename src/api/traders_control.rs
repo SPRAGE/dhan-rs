@@ -1,7 +1,7 @@
 //! Trader's Control endpoints — Kill Switch, P&L Based Exit.
 
 use crate::client::DhanClient;
-use crate::error::Result;
+use crate::error::{DhanError, Result};
 use crate::types::traders_control::*;
 
 impl DhanClient {
@@ -11,9 +11,19 @@ impl DhanClient {
     ///
     /// **Endpoint:** `POST /v2/killswitch?killSwitchStatus={status}`
     pub async fn manage_kill_switch(&self, status: &str) -> Result<KillSwitchResponse> {
-        let path = format!("/v2/killswitch?killSwitchStatus={status}");
-        // POST with no body — send an empty JSON object.
-        self.post(&path, &serde_json::json!({})).await
+        if !matches!(status, "ACTIVATE" | "DEACTIVATE") {
+            return Err(DhanError::InvalidArgument(
+                "kill switch status must be ACTIVATE or DEACTIVATE".into(),
+            ));
+        }
+        // The only accepted values are fixed protocol enums, so no caller
+        // input is interpolated into the query string.
+        let path = match status {
+            "ACTIVATE" => "/v2/killswitch?killSwitchStatus=ACTIVATE",
+            "DEACTIVATE" => "/v2/killswitch?killSwitchStatus=DEACTIVATE",
+            _ => unreachable!("status was validated above"),
+        };
+        self.post_without_body(path).await
     }
 
     /// Retrieve current kill switch status.
@@ -25,9 +35,11 @@ impl DhanClient {
 
     /// Configure P&L-based auto-exit for the current trading day.
     ///
-    /// **Endpoint:** `PUT /v2/pnlExit`
+    /// **Endpoint:** `POST /v2/pnlExit`
     pub async fn set_pnl_exit(&self, req: &PnlExitRequest) -> Result<PnlExitResponse> {
-        self.put("/v2/pnlExit", req).await
+        req.validate()
+            .map_err(|message| DhanError::InvalidArgument(message.into()))?;
+        self.post("/v2/pnlExit", req).await
     }
 
     /// Disable the active P&L-based exit configuration.

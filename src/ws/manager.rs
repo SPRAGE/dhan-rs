@@ -1,110 +1,47 @@
 #![allow(missing_docs)]
-//! Multi-connection market feed manager for DhanHQ WebSocket.
+//! Supervised, multi-connection DhanHQ standard market-feed manager.
 //!
-//! Manages up to 5 concurrent WebSocket connections, each handling up to 5,000
-//! instruments, for a total capacity of **25,000 instruments**. Provides
-//! automatic load-balancing, health monitoring, auto-reconnect, and both
-//! parsed and raw-frame delivery channels.
-//!
-//! # Architecture
-//!
-//! ```text
-//!            ┌─────────────────────────────────┐
-//!            │        DhanFeedManager           │
-//!            │  (builder, subscription routing) │
-//!            └──┬────────┬────────┬─────────┬───┘
-//!               │        │        │         │
-//!          Connection 0  ...  Connection N  │
-//!          (ws task)          (ws task)      │
-//!               │        │        │         │
-//!          broadcast::Sender  ──────────────┘
-//!               │        │        │
-//!          Receivers (user spawns per-channel consumers)
-//! ```
-//!
-//! Each connection runs in its own Tokio task. Binary frames are either:
-//! - **Parsed** into [`MarketFeedEvent`] and sent on a `broadcast` channel, or
-//! - **Raw** `bytes::Bytes` forwarded on a separate `broadcast` channel for
-//!   zero-copy / low-latency consumers.
-//!
-//! # Quick Start
-//!
-//! ```no_run
-//! use dhan_rs::ws::manager::{DhanFeedManagerBuilder, DhanFeedManager, ConnectionId};
-//! use dhan_rs::ws::market_feed::Instrument;
-//! use dhan_rs::types::enums::FeedRequestCode;
-//!
-//! # #[tokio::main]
-//! # async fn main() -> dhan_rs::error::Result<()> {
-//! let mut manager = DhanFeedManagerBuilder::new("client-id", "access-token")
-//!     .max_connections(3)
-//!     .max_instruments_per_connection(5000)
-//!     .enable_raw_frames(true)
-//!     .reconnect_delay_ms(2000)
-//!     .build();
-//!
-//! manager.start().await?;
-//!
-//! // Subscribe — instruments are distributed automatically
-//! let instruments = vec![
-//!     Instrument::new("NSE_EQ", "1333"),
-//!     Instrument::new("NSE_EQ", "11536"),
-//! ];
-//! manager
-//!     .subscribe(&instruments, FeedRequestCode::SubscribeTicker)
-//!     .await?;
-//!
-//! // Consume parsed events from a specific connection
-//! if let Some(mut rx) = manager.get_parsed_channel(ConnectionId(0)) {
-//!     tokio::spawn(async move {
-//!         while let Ok(event) = rx.recv().await {
-//!             println!("{event:?}");
-//!         }
-//!     });
-//! }
-//!
-//! // Or consume raw binary frames for advanced zero-copy processing
-//! if let Some(mut rx) = manager.get_raw_channel(ConnectionId(0)) {
-//!     tokio::spawn(async move {
-//!         while let Ok(frame) = rx.recv().await {
-//!             println!("raw frame: {} bytes", frame.len());
-//!         }
-//!     });
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Limits
-//!
-//! - Maximum **5** WebSocket connections per user
-//! - Up to **5,000** instruments per connection
-//! - Up to **100** instruments per subscribe/unsubscribe message
-//! - Total capacity: **25,000** instruments
+//! Connections are opened lazily on first subscription.  Each live socket is
+//! owned by exactly one supervisor task; callers change desired state through
+//! commands, so no mutex is held across network I/O.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use url::Url;
 
 use crate::constants::WS_MARKET_FEED_URL;
 use crate::error::{DhanError, Result};
 use crate::types::enums::FeedRequestCode;
 use crate::ws::market_feed::{Instrument, MarketFeedEvent, parse_packet};
 
-// ---------------------------------------------------------------------------
-// Connection ID
-// ---------------------------------------------------------------------------
+const DHAN_MAX_CONNECTIONS: u8 = 5;
+const DHAN_MAX_INSTRUMENTS: usize = 5_000;
+const DHAN_CONTROL_FRAME_LIMIT: usize = 100;
+const COMMAND_CAPACITY: usize = 64;
+const LIFECYCLE_CAPACITY: usize = 256;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const NO_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const STABLE_RETRY_RESET: Duration = Duration::from_secs(60);
+const MAX_RETRY_BASE: Duration = Duration::from_secs(30);
 
-/// Identifies one of the managed WebSocket connections (0–4).
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type DesiredSubscriptions = HashMap<InstrumentKey, (Instrument, FeedRequestCode)>;
+
+/// Identifies one of the managed WebSocket connection slots (0-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub u8);
 
@@ -114,37 +51,179 @@ impl std::fmt::Display for ConnectionId {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Connection health
-// ---------------------------------------------------------------------------
+/// Truthful lifecycle state of a connection supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLifecycle {
+    Stopped,
+    Idle,
+    Connecting,
+    Resubscribing,
+    ReadinessPending,
+    Live,
+    Degraded,
+    Backoff,
+    Blocked,
+    Closing,
+}
+
+/// Data-quality state is independent of transport connectivity. In
+/// particular, a reconnect cannot repair ticks already missed during a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDataQuality {
+    Unavailable,
+    ReadinessPending,
+    Current,
+    GapDetected,
+}
+
+/// Typed cause of a market-data gap that requires caller reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GapCause {
+    Disconnect {
+        close_code: Option<u16>,
+        reason: String,
+    },
+    ParseError {
+        error: String,
+    },
+    ReceiverLag {
+        dropped: u64,
+    },
+    NoReceiver {
+        event: &'static str,
+    },
+}
+
+/// Typed control-plane events emitted separately from market ticks.
+#[derive(Debug, Clone)]
+pub enum ManagerLifecycleEvent {
+    StateChanged {
+        id: ConnectionId,
+        state: ConnectionLifecycle,
+    },
+    Connected {
+        id: ConnectionId,
+        credential_version: u64,
+    },
+    Disconnected {
+        id: ConnectionId,
+        close_code: Option<u16>,
+        reason: String,
+    },
+    DhanDisconnected {
+        id: ConnectionId,
+        reason_code: i16,
+    },
+    ParseError {
+        id: ConnectionId,
+        error: String,
+    },
+    ReceiverLag {
+        id: ConnectionId,
+        dropped: u64,
+    },
+    GapDetected {
+        id: ConnectionId,
+        cause: GapCause,
+    },
+    GapAcknowledged {
+        id: ConnectionId,
+    },
+    ReadinessFailure {
+        id: ConnectionId,
+        error: String,
+    },
+    NoReceiver {
+        id: ConnectionId,
+        event: &'static str,
+    },
+    RetryScheduled {
+        id: ConnectionId,
+        attempt: u64,
+        delay: Duration,
+    },
+    Error {
+        id: ConnectionId,
+        error: String,
+    },
+    Stopped {
+        id: ConnectionId,
+        error: Option<String>,
+    },
+}
 
 /// Health status of a single managed connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionHealth {
-    /// Whether the connection's background task is alive.
+    /// Whether the slot's background supervisor task is alive.
     pub is_alive: bool,
-    /// The connection's identifier.
     pub id: ConnectionId,
-    /// Number of instruments currently subscribed on this connection.
+    /// Latest desired subscription count (not a server acknowledgement).
     pub instrument_count: usize,
-    /// Number of reconnections that have occurred.
+    /// Successful connections after the first transport.
     pub reconnect_count: u64,
+    pub lifecycle: ConnectionLifecycle,
+    pub transport_connected: bool,
+    /// True only after a valid binary data frame on the current transport.
+    pub data_live: bool,
+    /// Durable data quality. `GapDetected` remains until acknowledge_gap().
+    pub data_quality: MarketDataQuality,
+    pub gap_cause: Option<GapCause>,
+    pub gap_detected_at: Option<SystemTime>,
+    pub gap_count: u64,
+    pub desired_generation: u64,
+    /// Latest desired generation completely written to the current transport.
+    pub applied_generation: u64,
+    /// Current consecutive retry attempt.
+    pub retry_count: u64,
+    pub last_error: Option<String>,
+    pub last_frame_at: Option<SystemTime>,
+    pub last_data_at: Option<SystemTime>,
+    pub last_state_change_at: SystemTime,
+    pub retry_at: Option<SystemTime>,
+    pub parser_error_count: u64,
+    pub lagged_event_count: u64,
+    /// Latest credential version observed by the supervisor. While a socket is
+    /// live this may be newer than the version that authenticated that socket.
+    pub credential_version: u64,
 }
 
-/// Aggregate health summary across all managed connections.
+impl ConnectionHealth {
+    fn new(id: ConnectionId) -> Self {
+        Self {
+            is_alive: false,
+            id,
+            instrument_count: 0,
+            reconnect_count: 0,
+            lifecycle: ConnectionLifecycle::Stopped,
+            transport_connected: false,
+            data_live: false,
+            data_quality: MarketDataQuality::Unavailable,
+            gap_cause: None,
+            gap_detected_at: None,
+            gap_count: 0,
+            desired_generation: 0,
+            applied_generation: 0,
+            retry_count: 0,
+            last_error: None,
+            last_frame_at: None,
+            last_data_at: None,
+            last_state_change_at: SystemTime::now(),
+            retry_at: None,
+            parser_error_count: 0,
+            lagged_event_count: 0,
+            credential_version: 0,
+        }
+    }
+}
+
+/// Aggregate health summary across all configured slots.
 #[derive(Debug, Clone)]
 pub struct HealthSummary {
-    /// Per-connection health snapshots.
     pub connections: Vec<ConnectionHealth>,
-    /// Total instruments subscribed across all connections.
     pub total_instruments: usize,
-    /// Number of connections that are alive.
     pub alive_connections: usize,
 }
-
-// ---------------------------------------------------------------------------
-// Internal subscribe request (reuses market_feed structure)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
 #[allow(non_snake_case)]
@@ -154,26 +233,22 @@ struct FeedSubscribeRequest {
     InstrumentList: Vec<Instrument>,
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+#[derive(Debug, Serialize)]
+#[allow(non_snake_case)]
+struct FeedDisconnectRequest {
+    RequestCode: u8,
+}
 
-/// Configuration for the [`DhanFeedManager`].
+/// Configuration for [`DhanFeedManager`].
 #[derive(Debug, Clone)]
 pub struct DhanFeedConfig {
-    /// Maximum number of concurrent WebSocket connections (1–5).
     pub max_connections: u8,
-    /// Maximum instruments per connection (up to 5,000).
     pub max_instruments_per_connection: usize,
-    /// Whether raw binary frames should also be broadcast.
     pub enable_raw_frames: bool,
-    /// Delay before attempting reconnection (milliseconds).
+    /// Initial exponential retry base in milliseconds. Full jitter is applied.
     pub reconnect_delay_ms: u64,
-    /// Broadcast channel capacity for parsed events per connection.
     pub parsed_channel_capacity: usize,
-    /// Broadcast channel capacity for raw frames per connection.
     pub raw_channel_capacity: usize,
-    /// Whether to automatically reconnect on disconnect.
     pub auto_reconnect: bool,
 }
 
@@ -181,101 +256,85 @@ impl Default for DhanFeedConfig {
     fn default() -> Self {
         Self {
             max_connections: 5,
-            max_instruments_per_connection: 5_000,
+            max_instruments_per_connection: DHAN_MAX_INSTRUMENTS,
             enable_raw_frames: false,
-            reconnect_delay_ms: 2_000,
-            parsed_channel_capacity: 4096,
-            raw_channel_capacity: 4096,
+            reconnect_delay_ms: 250,
+            parsed_channel_capacity: 4_096,
+            raw_channel_capacity: 4_096,
             auto_reconnect: true,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
-
-/// Builder for constructing a [`DhanFeedManager`] with custom configuration.
-///
-/// # Example
-///
-/// ```no_run
-/// use dhan_rs::ws::manager::DhanFeedManagerBuilder;
-///
-/// let manager = DhanFeedManagerBuilder::new("client_id", "access_token")
-///     .max_connections(3)
-///     .enable_raw_frames(true)
-///     .build();
-/// ```
+/// Builder for [`DhanFeedManager`].
 pub struct DhanFeedManagerBuilder {
     client_id: String,
     access_token: String,
     config: DhanFeedConfig,
+    endpoint: String,
 }
 
 impl DhanFeedManagerBuilder {
-    /// Create a new builder with the given credentials.
     pub fn new(client_id: impl Into<String>, access_token: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
             access_token: access_token.into(),
             config: DhanFeedConfig::default(),
+            endpoint: WS_MARKET_FEED_URL.to_owned(),
         }
     }
 
-    /// Set maximum number of connections (1–5). Default: 5.
     pub fn max_connections(mut self, n: u8) -> Self {
-        self.config.max_connections = n.clamp(1, 5);
+        self.config.max_connections = n.clamp(1, DHAN_MAX_CONNECTIONS);
         self
     }
 
-    /// Set maximum instruments per connection (up to 5,000). Default: 5,000.
     pub fn max_instruments_per_connection(mut self, n: usize) -> Self {
-        self.config.max_instruments_per_connection = n.min(5_000);
+        self.config.max_instruments_per_connection = n.min(DHAN_MAX_INSTRUMENTS);
         self
     }
 
-    /// Enable or disable raw binary frame broadcasting. Default: false.
     pub fn enable_raw_frames(mut self, enable: bool) -> Self {
         self.config.enable_raw_frames = enable;
         self
     }
 
-    /// Set the reconnect delay in milliseconds. Default: 2,000.
     pub fn reconnect_delay_ms(mut self, ms: u64) -> Self {
         self.config.reconnect_delay_ms = ms;
         self
     }
 
-    /// Set the broadcast channel capacity for parsed events. Default: 4,096.
     pub fn parsed_channel_capacity(mut self, cap: usize) -> Self {
         self.config.parsed_channel_capacity = cap;
         self
     }
 
-    /// Set the broadcast channel capacity for raw frames. Default: 4,096.
     pub fn raw_channel_capacity(mut self, cap: usize) -> Self {
         self.config.raw_channel_capacity = cap;
         self
     }
 
-    /// Enable or disable auto-reconnect on disconnect. Default: true.
     pub fn auto_reconnect(mut self, enable: bool) -> Self {
         self.config.auto_reconnect = enable;
         self
     }
 
-    /// Build the [`DhanFeedManager`].
+    /// Override the WebSocket endpoint, primarily for local deterministic tests.
+    pub fn market_feed_url(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
     pub fn build(self) -> DhanFeedManager {
-        DhanFeedManager::new(self.client_id, self.access_token, self.config)
+        DhanFeedManager::new_with_endpoint(
+            self.client_id,
+            self.access_token,
+            self.config,
+            self.endpoint,
+        )
     }
 }
 
-// ---------------------------------------------------------------------------
-// Instrument key for tracking subscriptions
-// ---------------------------------------------------------------------------
-
-/// A unique key for an instrument (exchange_segment + security_id).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct InstrumentKey {
     exchange_segment: String,
@@ -291,660 +350,1517 @@ impl From<&Instrument> for InstrumentKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-connection state
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone)]
+struct Credentials {
+    token: String,
+    version: u64,
+}
+
+enum SupervisorCommand {
+    ReplaceDesired {
+        generation: u64,
+        desired: DesiredSubscriptions,
+        acknowledged: oneshot::Sender<()>,
+    },
+    AcknowledgeGap {
+        acknowledged: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    Shutdown {
+        acknowledged: oneshot::Sender<()>,
+    },
+}
 
 struct ManagedConnection {
     id: ConnectionId,
-    /// Channel sender for parsed events.
     parsed_tx: broadcast::Sender<MarketFeedEvent>,
-    /// Channel sender for raw frames (if enabled).
     raw_tx: Option<broadcast::Sender<Bytes>>,
-    /// The background task handle.
+    lifecycle_tx: broadcast::Sender<ManagerLifecycleEvent>,
+    health_rx: watch::Receiver<ConnectionHealth>,
+    health_tx: watch::Sender<ConnectionHealth>,
+    command_tx: mpsc::Sender<SupervisorCommand>,
+    command_rx: Option<mpsc::Receiver<SupervisorCommand>>,
     task: Option<JoinHandle<()>>,
-    /// The write half of the WebSocket, shared with the background task.
-    writer: Arc<Mutex<Option<WriterHalf>>>,
-    /// Instruments subscribed on this connection.
-    instruments: HashMap<InstrumentKey, (Instrument, FeedRequestCode)>,
-    /// Reconnect count.
-    reconnect_count: u64,
+    instruments: DesiredSubscriptions,
+    desired_generation: u64,
+    previous_close: Arc<StdMutex<HashMap<(u8, u32), MarketFeedEvent>>>,
 }
 
-type WriterHalf =
-    futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-
-// ---------------------------------------------------------------------------
-// DhanFeedManager
-// ---------------------------------------------------------------------------
-
-/// Multi-connection manager for DhanHQ market feed WebSocket streams.
-///
-/// Manages up to 5 connections, each supporting up to 5,000 instruments,
-/// with automatic load-balancing, auto-reconnect, and both parsed and
-/// raw-frame delivery channels.
-///
-/// Use [`DhanFeedManagerBuilder`] for ergonomic construction.
-///
-/// # Example
-///
-/// ```no_run
-/// use dhan_rs::ws::manager::{DhanFeedManager, DhanFeedConfig, ConnectionId};
-/// use dhan_rs::ws::market_feed::Instrument;
-/// use dhan_rs::types::enums::FeedRequestCode;
-///
-/// # #[tokio::main]
-/// # async fn main() -> dhan_rs::error::Result<()> {
-/// let mut manager = DhanFeedManager::new(
-///     "client-id",
-///     "access-token",
-///     DhanFeedConfig::default(),
-/// );
-/// manager.start().await?;
-///
-/// let instruments = vec![Instrument::new("NSE_EQ", "1333")];
-/// manager.subscribe(&instruments, FeedRequestCode::SubscribeTicker).await?;
-///
-/// // Get a broadcast receiver for parsed events
-/// let mut rx = manager.get_parsed_channel(ConnectionId(0)).unwrap();
-/// tokio::spawn(async move {
-///     while let Ok(event) = rx.recv().await {
-///         println!("{event:?}");
-///     }
-/// });
-/// # Ok(())
-/// # }
-/// ```
+/// Multi-connection manager for the standard DhanHQ market feed.
 pub struct DhanFeedManager {
     client_id: String,
-    access_token: String,
     config: DhanFeedConfig,
+    endpoint: String,
+    credentials_tx: watch::Sender<Credentials>,
     connections: Vec<ManagedConnection>,
     started: bool,
 }
 
 impl DhanFeedManager {
-    /// Create a new manager with explicit configuration.
-    ///
-    /// Prefer [`DhanFeedManagerBuilder`] for a more ergonomic API.
     pub fn new(
         client_id: impl Into<String>,
         access_token: impl Into<String>,
         config: DhanFeedConfig,
     ) -> Self {
-        let client_id = client_id.into();
-        let access_token = access_token.into();
-        let n = config.max_connections as usize;
-
-        let connections = (0..n)
-            .map(|i| {
-                let (parsed_tx, _) = broadcast::channel(config.parsed_channel_capacity);
-                let raw_tx = if config.enable_raw_frames {
-                    let (tx, _) = broadcast::channel(config.raw_channel_capacity);
-                    Some(tx)
-                } else {
-                    None
-                };
-                ManagedConnection {
-                    id: ConnectionId(i as u8),
-                    parsed_tx,
-                    raw_tx,
-                    task: None,
-                    writer: Arc::new(Mutex::new(None)),
-                    instruments: HashMap::new(),
-                    reconnect_count: 0,
-                }
-            })
-            .collect();
-
-        Self {
+        Self::new_with_endpoint(
             client_id,
             access_token,
             config,
+            WS_MARKET_FEED_URL.to_owned(),
+        )
+    }
+
+    fn new_with_endpoint(
+        client_id: impl Into<String>,
+        access_token: impl Into<String>,
+        config: DhanFeedConfig,
+        endpoint: String,
+    ) -> Self {
+        let (credentials_tx, _) = watch::channel(Credentials {
+            token: access_token.into(),
+            version: 0,
+        });
+        let slot_count = config.max_connections.min(DHAN_MAX_CONNECTIONS) as usize;
+        let connections = (0..slot_count)
+            .map(|index| Self::new_connection(ConnectionId(index as u8), &config))
+            .collect();
+        Self {
+            client_id: client_id.into(),
+            config,
+            endpoint,
+            credentials_tx,
             connections,
             started: false,
         }
     }
 
-    /// Start all configured WebSocket connections.
-    ///
-    /// Each connection is run in a dedicated Tokio task that reads binary
-    /// frames, parses them, and distributes events on broadcast channels.
+    fn new_connection(id: ConnectionId, config: &DhanFeedConfig) -> ManagedConnection {
+        // Use one here to keep the infallible constructor from panicking. start()
+        // rejects the caller's zero capacity before any task or socket exists.
+        let (parsed_tx, _) = broadcast::channel(config.parsed_channel_capacity.max(1));
+        let raw_tx = config.enable_raw_frames.then(|| {
+            let (tx, _) = broadcast::channel(config.raw_channel_capacity.max(1));
+            tx
+        });
+        let (lifecycle_tx, _) = broadcast::channel(LIFECYCLE_CAPACITY);
+        let (health_tx, health_rx) = watch::channel(ConnectionHealth::new(id));
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        ManagedConnection {
+            id,
+            parsed_tx,
+            raw_tx,
+            lifecycle_tx,
+            health_rx,
+            health_tx,
+            command_tx,
+            command_rx: Some(command_rx),
+            task: None,
+            instruments: HashMap::new(),
+            desired_generation: 0,
+            previous_close: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Validate configuration and enable subscriptions. No socket is consumed
+    /// until the first instrument is requested.
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
             return Err(DhanError::InvalidArgument("manager already started".into()));
         }
-
-        for conn in &mut self.connections {
-            Self::spawn_connection(
-                &self.client_id,
-                &self.access_token,
-                conn,
-                self.config.auto_reconnect,
-                self.config.reconnect_delay_ms,
-                self.config.enable_raw_frames,
-            )
-            .await?;
-        }
+        self.validate_config()?;
+        Url::parse(&self.endpoint)?;
         self.started = true;
-
         tracing::info!(
-            connections = self.connections.len(),
-            "DhanFeedManager started"
+            slots = self.connections.len(),
+            "DhanFeedManager started lazily"
         );
         Ok(())
     }
 
-    /// Subscribe instruments on the manager.
-    ///
-    /// Instruments are distributed across connections using round-robin
-    /// load-balancing, respecting the per-connection instrument limit.
-    /// Subscriptions are sent in batches of 100 per the Dhan API limit.
+    fn validate_config(&self) -> Result<()> {
+        if !(1..=DHAN_MAX_CONNECTIONS).contains(&self.config.max_connections) {
+            return Err(DhanError::InvalidArgument(
+                "max_connections must be between 1 and 5".into(),
+            ));
+        }
+        if !(1..=DHAN_MAX_INSTRUMENTS).contains(&self.config.max_instruments_per_connection) {
+            return Err(DhanError::InvalidArgument(
+                "max_instruments_per_connection must be between 1 and 5000".into(),
+            ));
+        }
+        if self.config.parsed_channel_capacity == 0 || self.config.raw_channel_capacity == 0 {
+            return Err(DhanError::InvalidArgument(
+                "channel capacities must be nonzero".into(),
+            ));
+        }
+        if self.config.reconnect_delay_ms == 0 {
+            return Err(DhanError::InvalidArgument(
+                "reconnect_delay_ms must be nonzero to prevent a hot retry loop".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replace the credential used by all future connection attempts.
+    pub fn update_access_token(&mut self, access_token: impl Into<String>) -> Result<()> {
+        let token = access_token.into();
+        if token.is_empty() {
+            return Err(DhanError::InvalidArgument(
+                "access token must not be empty".into(),
+            ));
+        }
+        let version = self.credentials_tx.borrow().version.saturating_add(1);
+        self.credentials_tx
+            .send_replace(Credentials { token, version });
+        Ok(())
+    }
+
+    /// Clear a durable market-data gap after the caller has reconciled current
+    /// state from an authoritative snapshot. A reconnect alone never calls
+    /// this method or clears the quality latch.
+    pub async fn acknowledge_gap(&mut self, id: ConnectionId) -> Result<()> {
+        self.ensure_started()?;
+        let connection = self.connections.get(id.0 as usize).ok_or_else(|| {
+            DhanError::InvalidArgument(format!("unknown connection slot {}", id.0))
+        })?;
+        if connection.health_rx.borrow().data_quality != MarketDataQuality::GapDetected {
+            return Ok(());
+        }
+        if !connection.health_rx.borrow().data_live {
+            return Err(DhanError::InvalidArgument(format!(
+                "{id} gap can be acknowledged only after the replacement transport is data-live"
+            )));
+        }
+        if !connection
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return Err(DhanError::InvalidArgument(format!(
+                "{id} has no live supervisor to acknowledge"
+            )));
+        }
+        let command_tx = connection.command_tx.clone();
+        let (acknowledged, receiver) = oneshot::channel();
+        command_tx
+            .send(SupervisorCommand::AcknowledgeGap { acknowledged })
+            .await
+            .map_err(|_| DhanError::InvalidArgument(format!("{id} supervisor unavailable")))?;
+        receiver
+            .await
+            .map_err(|_| DhanError::InvalidArgument(format!("{id} supervisor unavailable")))?
+            .map_err(DhanError::InvalidArgument)
+    }
+
     pub async fn subscribe(
         &mut self,
         instruments: &[Instrument],
         mode: FeedRequestCode,
     ) -> Result<()> {
-        if !self.started {
-            return Err(DhanError::InvalidArgument(
-                "manager not started — call start() first".into(),
-            ));
+        self.ensure_started()?;
+        validate_subscribe_mode(mode)?;
+        validate_instruments(instruments)?;
+        if instruments.is_empty() {
+            return Ok(());
         }
 
-        // Distribute instruments across connections
-        let assignments = self.assign_instruments(instruments, mode)?;
-
-        for (conn_idx, batch) in assignments {
-            let conn = &mut self.connections[conn_idx];
-            let writer = conn.writer.clone();
-
-            // Send in chunks of 100
-            for chunk in batch.chunks(100) {
-                let req = FeedSubscribeRequest {
-                    RequestCode: mode as u8,
-                    InstrumentCount: chunk.len(),
-                    InstrumentList: chunk.to_vec(),
-                };
-                let json = serde_json::to_string(&req)?;
-
-                let mut guard = writer.lock().await;
-                if let Some(ref mut w) = *guard {
-                    w.send(Message::Text(json.into())).await?;
-                } else {
-                    return Err(DhanError::InvalidArgument(format!(
-                        "{} writer not available",
-                        conn.id
-                    )));
-                }
+        let old: Vec<_> = self
+            .connections
+            .iter()
+            .map(|connection| connection.instruments.clone())
+            .collect();
+        let mut candidate = old.clone();
+        let mut loads: Vec<_> = candidate.iter().map(HashMap::len).collect();
+        let mut locations = HashMap::new();
+        for (index, desired) in candidate.iter().enumerate() {
+            for key in desired.keys() {
+                locations.insert(key.clone(), index);
             }
-
-            // Track subscriptions
-            for inst in &batch {
-                let key = InstrumentKey::from(inst);
-                conn.instruments.insert(key, (inst.clone(), mode));
-            }
-
-            tracing::debug!(
-                connection = %conn.id,
-                count = batch.len(),
-                mode = ?mode,
-                "Subscribed instruments"
-            );
         }
 
-        Ok(())
+        for instrument in instruments {
+            let key = InstrumentKey::from(instrument);
+            if let Some(index) = locations.get(&key).copied() {
+                candidate[index].insert(key, (instrument.clone(), mode));
+                continue;
+            }
+            let index = loads
+                .iter()
+                .enumerate()
+                .filter(|(_, load)| **load < self.config.max_instruments_per_connection)
+                .min_by_key(|(_, load)| **load)
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    DhanError::InvalidArgument(format!(
+                        "all connections at capacity ({} instruments each)",
+                        self.config.max_instruments_per_connection
+                    ))
+                })?;
+            candidate[index].insert(key.clone(), (instrument.clone(), mode));
+            loads[index] += 1;
+            locations.insert(key, index);
+        }
+
+        self.commit_desired(candidate, old).await
     }
 
-    /// Unsubscribe instruments.
-    ///
-    /// Finds which connection each instrument lives on and sends the
-    /// appropriate unsubscribe request.
+    /// Remove instruments according to their tracked subscription mode.  The
+    /// supplied request code is validated as an unsubscribe operation, but the
+    /// wire code is derived from the manager's recorded mode.
     pub async fn unsubscribe(
         &mut self,
         instruments: &[Instrument],
         mode: FeedRequestCode,
     ) -> Result<()> {
-        if !self.started {
-            return Err(DhanError::InvalidArgument("manager not started".into()));
-        }
-
-        // Group instruments by which connection they're on
-        let mut per_conn: HashMap<usize, Vec<Instrument>> = HashMap::new();
-        for inst in instruments {
-            let key = InstrumentKey::from(inst);
-            for (idx, conn) in self.connections.iter().enumerate() {
-                if conn.instruments.contains_key(&key) {
-                    per_conn.entry(idx).or_default().push(inst.clone());
+        self.ensure_started()?;
+        validate_unsubscribe_mode(mode)?;
+        validate_instruments(instruments)?;
+        let old: Vec<_> = self
+            .connections
+            .iter()
+            .map(|connection| connection.instruments.clone())
+            .collect();
+        let mut candidate = old.clone();
+        for instrument in instruments {
+            let key = InstrumentKey::from(instrument);
+            for desired in &mut candidate {
+                if desired.remove(&key).is_some() {
                     break;
                 }
             }
         }
+        self.commit_desired(candidate, old).await
+    }
 
-        for (conn_idx, batch) in per_conn {
-            let conn = &mut self.connections[conn_idx];
-            let writer = conn.writer.clone();
-
-            for chunk in batch.chunks(100) {
-                let req = FeedSubscribeRequest {
-                    RequestCode: mode as u8,
-                    InstrumentCount: chunk.len(),
-                    InstrumentList: chunk.to_vec(),
-                };
-                let json = serde_json::to_string(&req)?;
-
-                let mut guard = writer.lock().await;
-                if let Some(ref mut w) = *guard {
-                    w.send(Message::Text(json.into())).await?;
-                }
-            }
-
-            // Remove from tracking
-            for inst in &batch {
-                let key = InstrumentKey::from(inst);
-                conn.instruments.remove(&key);
-            }
-
-            tracing::debug!(
-                connection = %conn.id,
-                count = batch.len(),
-                mode = ?mode,
-                "Unsubscribed instruments"
-            );
+    async fn commit_desired(
+        &mut self,
+        candidate: Vec<DesiredSubscriptions>,
+        old: Vec<DesiredSubscriptions>,
+    ) -> Result<()> {
+        let affected: Vec<_> = candidate
+            .iter()
+            .zip(&old)
+            .enumerate()
+            .filter_map(|(index, (new, old))| (!desired_equal(new, old)).then_some(index))
+            .collect();
+        if affected.is_empty() {
+            return Ok(());
         }
 
+        // Desired state is committed before network work. Every supervisor
+        // acknowledges its local replacement; if a task unexpectedly vanished,
+        // all manager-side state is rolled back and previously updated tasks are
+        // restored before the error is returned.
+        let mut newly_spawned = HashSet::new();
+        for &index in &affected {
+            self.connections[index].instruments = candidate[index].clone();
+            self.connections[index].desired_generation =
+                self.connections[index].desired_generation.saturating_add(1);
+            if self.ensure_supervisor(index)? {
+                newly_spawned.insert(index);
+            }
+        }
+
+        let mut applied = Vec::new();
+        for &index in &affected {
+            if newly_spawned.contains(&index) {
+                // The initial desired generation is moved into the newly
+                // spawned supervisor, so no duplicate command is needed.
+                applied.push(index);
+                continue;
+            }
+            let (acknowledged, receiver) = oneshot::channel();
+            let command = SupervisorCommand::ReplaceDesired {
+                generation: self.connections[index].desired_generation,
+                desired: self.connections[index].instruments.clone(),
+                acknowledged,
+            };
+            let result = self.connections[index].command_tx.send(command).await;
+            if result.is_ok() && receiver.await.is_ok() {
+                applied.push(index);
+                continue;
+            }
+
+            for &rollback_index in &affected {
+                self.connections[rollback_index].instruments = old[rollback_index].clone();
+                self.connections[rollback_index].desired_generation = self.connections
+                    [rollback_index]
+                    .desired_generation
+                    .saturating_add(1);
+            }
+            for rollback_index in applied {
+                let (acknowledged, _) = oneshot::channel();
+                let _ = self.connections[rollback_index]
+                    .command_tx
+                    .send(SupervisorCommand::ReplaceDesired {
+                        generation: self.connections[rollback_index].desired_generation,
+                        desired: old[rollback_index].clone(),
+                        acknowledged,
+                    })
+                    .await;
+            }
+            return Err(DhanError::InvalidArgument(format!(
+                "{} supervisor unavailable",
+                self.connections[index].id
+            )));
+        }
         Ok(())
     }
 
-    /// Get a broadcast receiver for parsed [`MarketFeedEvent`]s from a
-    /// specific connection.
-    ///
-    /// Returns `None` if the connection ID is out of range.
+    fn ensure_started(&self) -> Result<()> {
+        if self.started {
+            Ok(())
+        } else {
+            Err(DhanError::InvalidArgument(
+                "manager not started - call start() first".into(),
+            ))
+        }
+    }
+
+    fn ensure_supervisor(&mut self, index: usize) -> Result<bool> {
+        if self.connections[index]
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return Ok(false);
+        }
+        if self.connections[index].task.is_some() {
+            return Err(DhanError::InvalidArgument(format!(
+                "{} supervisor terminated; inspect lifecycle health",
+                self.connections[index].id
+            )));
+        }
+        let receiver = self.connections[index].command_rx.take().ok_or_else(|| {
+            DhanError::InvalidArgument("supervisor command receiver unavailable".into())
+        })?;
+        let arguments = SupervisorArguments {
+            id: self.connections[index].id,
+            client_id: self.client_id.clone(),
+            endpoint: self.endpoint.clone(),
+            auto_reconnect: self.config.auto_reconnect,
+            retry_base: Duration::from_millis(self.config.reconnect_delay_ms),
+            enable_raw: self.config.enable_raw_frames,
+            parsed_capacity: self.config.parsed_channel_capacity,
+            raw_capacity: self.config.raw_channel_capacity,
+            parsed_tx: self.connections[index].parsed_tx.clone(),
+            raw_tx: self.connections[index].raw_tx.clone(),
+            lifecycle_tx: self.connections[index].lifecycle_tx.clone(),
+            health_tx: self.connections[index].health_tx.clone(),
+            credentials_rx: self.credentials_tx.subscribe(),
+            command_rx: receiver,
+            previous_close: self.connections[index].previous_close.clone(),
+            desired: self.connections[index].instruments.clone(),
+            generation: self.connections[index].desired_generation,
+        };
+        self.connections[index].task = Some(tokio::spawn(supervisor(arguments)));
+        Ok(true)
+    }
+
     pub fn get_parsed_channel(
         &self,
         id: ConnectionId,
     ) -> Option<broadcast::Receiver<MarketFeedEvent>> {
         self.connections
             .get(id.0 as usize)
-            .map(|c| c.parsed_tx.subscribe())
+            .map(|connection| connection.parsed_tx.subscribe())
     }
 
-    /// Get broadcast receivers for parsed events from **all** connections.
-    ///
-    /// Returns a vec of `(ConnectionId, Receiver)` tuples.
     pub fn get_all_parsed_channels(
         &self,
     ) -> Vec<(ConnectionId, broadcast::Receiver<MarketFeedEvent>)> {
         self.connections
             .iter()
-            .map(|c| (c.id, c.parsed_tx.subscribe()))
+            .map(|connection| (connection.id, connection.parsed_tx.subscribe()))
             .collect()
     }
 
-    /// Get a broadcast receiver for raw binary frames from a specific
-    /// connection.
-    ///
-    /// Returns `None` if the connection ID is out of range or raw frames
-    /// were not enabled in the config.
     pub fn get_raw_channel(&self, id: ConnectionId) -> Option<broadcast::Receiver<Bytes>> {
         self.connections
             .get(id.0 as usize)
-            .and_then(|c| c.raw_tx.as_ref().map(|tx| tx.subscribe()))
+            .and_then(|connection| connection.raw_tx.as_ref().map(broadcast::Sender::subscribe))
     }
 
-    /// Get raw-frame receivers from **all** connections.
-    ///
-    /// Returns an empty vec if raw frames are not enabled.
     pub fn get_all_raw_channels(&self) -> Vec<(ConnectionId, broadcast::Receiver<Bytes>)> {
         self.connections
             .iter()
-            .filter_map(|c| c.raw_tx.as_ref().map(|tx| (c.id, tx.subscribe())))
+            .filter_map(|connection| {
+                connection
+                    .raw_tx
+                    .as_ref()
+                    .map(|sender| (connection.id, sender.subscribe()))
+            })
             .collect()
     }
 
-    /// Get health information for all managed connections.
+    /// Subscribe to durable lifecycle diagnostics for one connection slot.
+    pub fn get_lifecycle_channel(
+        &self,
+        id: ConnectionId,
+    ) -> Option<broadcast::Receiver<ManagerLifecycleEvent>> {
+        self.connections
+            .get(id.0 as usize)
+            .map(|connection| connection.lifecycle_tx.subscribe())
+    }
+
+    /// Watch the latest durable health snapshot for one connection slot.
+    pub fn get_health_channel(
+        &self,
+        id: ConnectionId,
+    ) -> Option<watch::Receiver<ConnectionHealth>> {
+        self.connections
+            .get(id.0 as usize)
+            .map(|connection| connection.health_rx.clone())
+    }
+
+    /// Retrieve cached one-shot Previous Close events, including values that
+    /// arrived before a broadcast receiver was created.
+    pub fn previous_close_snapshot(&self, id: ConnectionId) -> Vec<MarketFeedEvent> {
+        self.connections
+            .get(id.0 as usize)
+            .map(|connection| {
+                connection
+                    .previous_close
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .values()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn health(&self) -> HealthSummary {
         let connections: Vec<_> = self
             .connections
             .iter()
-            .map(|c| ConnectionHealth {
-                id: c.id,
-                is_alive: c.task.as_ref().is_some_and(|t| !t.is_finished()),
-                instrument_count: c.instruments.len(),
-                reconnect_count: c.reconnect_count,
+            .map(|connection| {
+                let mut health = connection.health_rx.borrow().clone();
+                health.is_alive = connection
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished());
+                health.instrument_count = connection.instruments.len();
+                health.desired_generation = connection.desired_generation;
+                health
             })
             .collect();
-
-        let total_instruments = connections.iter().map(|c| c.instrument_count).sum();
-        let alive_connections = connections.iter().filter(|c| c.is_alive).count();
-
         HealthSummary {
+            total_instruments: connections
+                .iter()
+                .map(|health| health.instrument_count)
+                .sum(),
+            alive_connections: connections.iter().filter(|health| health.is_alive).count(),
             connections,
-            total_instruments,
-            alive_connections,
         }
     }
 
-    /// Shut down all managed connections gracefully.
+    /// Gracefully stop reconnects, send Dhan RequestCode 12, complete a bounded
+    /// WebSocket close handshake, and join every supervisor. Abort is fallback.
     pub async fn shutdown(&mut self) -> Result<()> {
-        for conn in &mut self.connections {
-            // Send close frame
-            let mut guard = conn.writer.lock().await;
-            if let Some(ref mut w) = *guard {
-                let _ = w.send(Message::Close(None)).await;
-            }
-            *guard = None;
-
-            // Abort the background task
-            if let Some(task) = conn.task.take() {
-                task.abort();
-            }
-            conn.instruments.clear();
+        if !self.started {
+            return Ok(());
         }
-        self.started = false;
-
-        tracing::info!("DhanFeedManager shut down");
-        Ok(())
-    }
-
-    /// Total number of instruments subscribed across all connections.
-    pub fn total_instruments(&self) -> usize {
-        self.connections.iter().map(|c| c.instruments.len()).sum()
-    }
-
-    /// Get the configuration.
-    pub fn config(&self) -> &DhanFeedConfig {
-        &self.config
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal
-    // -----------------------------------------------------------------------
-
-    /// Assign instruments to connections using round-robin load balancing.
-    fn assign_instruments(
-        &self,
-        instruments: &[Instrument],
-        mode: FeedRequestCode,
-    ) -> Result<Vec<(usize, Vec<Instrument>)>> {
-        let mut assignments: HashMap<usize, Vec<Instrument>> = HashMap::new();
-        let _n = self.connections.len();
-        let max_per = self.config.max_instruments_per_connection;
-
-        // Build a set of already-subscribed keys so we skip duplicates
-        let mut all_keys: HashMap<InstrumentKey, usize> = HashMap::new();
-        for (idx, conn) in self.connections.iter().enumerate() {
-            for key in conn.instruments.keys() {
-                all_keys.insert(key.clone(), idx);
-            }
-        }
-
-        // Find the connection with fewest instruments for round-robin start
-        let mut conn_loads: Vec<usize> = self
-            .connections
-            .iter()
-            .map(|c| c.instruments.len())
-            .collect();
-
-        for inst in instruments {
-            let key = InstrumentKey::from(inst);
-
-            // Skip if already subscribed somewhere
-            if all_keys.contains_key(&key) {
+        let mut first_error = None;
+        for connection in &mut self.connections {
+            if connection.task.is_none() {
+                connection.instruments.clear();
                 continue;
             }
-
-            // Pick the connection with the fewest instruments
-            let best_idx = conn_loads
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, load)| *load)
-                .map(|(idx, _)| idx)
-                .ok_or_else(|| DhanError::InvalidArgument("no connections available".into()))?;
-
-            if conn_loads[best_idx] >= max_per {
-                return Err(DhanError::InvalidArgument(format!(
-                    "all connections at capacity ({max_per} instruments each)"
-                )));
+            let (acknowledged, receiver) = oneshot::channel();
+            if connection
+                .command_tx
+                .send(SupervisorCommand::Shutdown { acknowledged })
+                .await
+                .is_ok()
+                && timeout(CLOSE_TIMEOUT + JOIN_TIMEOUT, receiver)
+                    .await
+                    .is_err()
+            {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "{} graceful shutdown acknowledgement timed out",
+                        connection.id
+                    )
+                });
             }
-
-            assignments.entry(best_idx).or_default().push(inst.clone());
-            conn_loads[best_idx] += 1;
-            all_keys.insert(key, best_idx);
+            if let Some(mut task) = connection.task.take() {
+                if timeout(CLOSE_TIMEOUT + JOIN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = task.await;
+                    first_error.get_or_insert_with(|| {
+                        format!(
+                            "{} supervisor join timed out and was aborted",
+                            connection.id
+                        )
+                    });
+                }
+            }
+            connection.instruments.clear();
+            connection.desired_generation = 0;
+            connection
+                .previous_close
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+            connection.command_tx = command_tx;
+            connection.command_rx = Some(command_rx);
         }
-
-        let _ = mode; // mode used by caller for the subscribe message
-        Ok(assignments.into_iter().collect())
-    }
-
-    /// Spawn (or re-spawn) a WebSocket connection task for the given
-    /// connection slot.
-    async fn spawn_connection(
-        client_id: &str,
-        access_token: &str,
-        conn: &mut ManagedConnection,
-        auto_reconnect: bool,
-        reconnect_delay_ms: u64,
-        enable_raw: bool,
-    ) -> Result<()> {
-        let url = format!(
-            "{WS_MARKET_FEED_URL}?version=2&token={access_token}&clientId={client_id}&authType=2"
-        );
-
-        let (ws, _resp) = connect_async(&url).await?;
-        let (write, read) = ws.split();
-        *conn.writer.lock().await = Some(write);
-
-        let parsed_tx = conn.parsed_tx.clone();
-        let raw_tx = conn.raw_tx.clone();
-        let conn_id = conn.id;
-        let writer_arc = conn.writer.clone();
-
-        // Collect instruments to re-subscribe on reconnect
-        let existing_subs: Vec<(Instrument, FeedRequestCode)> =
-            conn.instruments.values().cloned().collect();
-
-        let client_id_owned = client_id.to_owned();
-        let access_token_owned = access_token.to_owned();
-
-        let task = tokio::spawn(async move {
-            Self::connection_loop(
-                conn_id,
-                read,
-                writer_arc,
-                parsed_tx,
-                raw_tx,
-                auto_reconnect,
-                reconnect_delay_ms,
-                enable_raw,
-                &client_id_owned,
-                &access_token_owned,
-                existing_subs,
-            )
-            .await;
-        });
-
-        conn.task = Some(task);
-
-        tracing::info!(connection = %conn.id, "WebSocket connection spawned");
-        Ok(())
-    }
-
-    /// The main loop for a single WebSocket connection.
-    ///
-    /// Reads frames, parses binary packets, broadcasts events, and handles
-    /// reconnection on failure.
-    #[allow(clippy::too_many_arguments)]
-    async fn connection_loop(
-        conn_id: ConnectionId,
-        mut read: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-        writer: Arc<Mutex<Option<WriterHalf>>>,
-        parsed_tx: broadcast::Sender<MarketFeedEvent>,
-        raw_tx: Option<broadcast::Sender<Bytes>>,
-        auto_reconnect: bool,
-        reconnect_delay_ms: u64,
-        enable_raw: bool,
-        client_id: &str,
-        access_token: &str,
-        existing_subs: Vec<(Instrument, FeedRequestCode)>,
-    ) {
-        // Re-subscribe existing instruments after initial connect or reconnect
-        if !existing_subs.is_empty() {
-            if let Err(e) = Self::resubscribe(&writer, &existing_subs).await {
-                tracing::error!(
-                    connection = %conn_id,
-                    error = %e,
-                    "Failed to resubscribe after connect"
-                );
-            }
-        }
-
-        loop {
-            match read.next().await {
-                Some(Ok(msg)) => match msg {
-                    Message::Binary(data) => {
-                        // Broadcast raw frame first (if enabled)
-                        if enable_raw {
-                            if let Some(ref tx) = raw_tx {
-                                let _ = tx.send(Bytes::from(data.to_vec()));
-                            }
-                        }
-
-                        // Parse and broadcast
-                        match parse_packet(&data) {
-                            Ok(event) => {
-                                let _ = parsed_tx.send(event);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    connection = %conn_id,
-                                    error = %e,
-                                    "Failed to parse packet"
-                                );
-                            }
-                        }
-                    }
-                    Message::Ping(_) | Message::Pong(_) => {}
-                    Message::Close(_) => {
-                        tracing::info!(
-                            connection = %conn_id,
-                            "WebSocket closed by server"
-                        );
-                        break;
-                    }
-                    Message::Text(text) => {
-                        tracing::debug!(
-                            connection = %conn_id,
-                            "Received text: {text}"
-                        );
-                    }
-                    _ => {}
-                },
-                Some(Err(e)) => {
-                    tracing::error!(
-                        connection = %conn_id,
-                        error = %e,
-                        "WebSocket error"
-                    );
-                    break;
-                }
-                None => {
-                    tracing::info!(
-                        connection = %conn_id,
-                        "WebSocket stream ended"
-                    );
-                    break;
-                }
-            }
-        }
-
-        // Reconnect if enabled
-        if auto_reconnect {
-            tracing::info!(
-                connection = %conn_id,
-                delay_ms = reconnect_delay_ms,
-                "Attempting reconnect..."
-            );
-            tokio::time::sleep(Duration::from_millis(reconnect_delay_ms)).await;
-
-            let url = format!(
-                "{WS_MARKET_FEED_URL}?version=2&token={access_token}&clientId={client_id}&authType=2"
-            );
-
-            match connect_async(&url).await {
-                Ok((ws, _)) => {
-                    let (write, new_read) = ws.split();
-                    *writer.lock().await = Some(write);
-
-                    tracing::info!(
-                        connection = %conn_id,
-                        "Reconnected successfully"
-                    );
-
-                    // Recurse into connection_loop for the new read half
-                    Box::pin(Self::connection_loop(
-                        conn_id,
-                        new_read,
-                        writer,
-                        parsed_tx,
-                        raw_tx,
-                        auto_reconnect,
-                        reconnect_delay_ms,
-                        enable_raw,
-                        client_id,
-                        access_token,
-                        existing_subs,
-                    ))
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        connection = %conn_id,
-                        error = %e,
-                        "Reconnection failed"
-                    );
-                }
-            }
+        self.started = false;
+        if let Some(error) = first_error {
+            Err(DhanError::InvalidArgument(error))
+        } else {
+            Ok(())
         }
     }
 
-    /// Re-subscribe a set of instruments on a connection writer.
-    async fn resubscribe(
-        writer: &Arc<Mutex<Option<WriterHalf>>>,
-        subs: &[(Instrument, FeedRequestCode)],
-    ) -> Result<()> {
-        // Group by mode
-        let mut by_mode: HashMap<u8, Vec<Instrument>> = HashMap::new();
-        for (inst, mode) in subs {
-            by_mode.entry(*mode as u8).or_default().push(inst.clone());
-        }
+    pub fn total_instruments(&self) -> usize {
+        self.connections
+            .iter()
+            .map(|connection| connection.instruments.len())
+            .sum()
+    }
 
-        let mut guard = writer.lock().await;
-        let w = guard.as_mut().ok_or_else(|| {
-            DhanError::InvalidArgument("writer not available for resubscribe".into())
-        })?;
-
-        for (mode_code, instruments) in by_mode {
-            for chunk in instruments.chunks(100) {
-                let req = FeedSubscribeRequest {
-                    RequestCode: mode_code,
-                    InstrumentCount: chunk.len(),
-                    InstrumentList: chunk.to_vec(),
-                };
-                let json = serde_json::to_string(&req)?;
-                w.send(Message::Text(json.into())).await?;
-            }
-        }
-
-        Ok(())
+    pub fn config(&self) -> &DhanFeedConfig {
+        &self.config
     }
 }
 
 impl Drop for DhanFeedManager {
     fn drop(&mut self) {
-        for conn in &mut self.connections {
-            if let Some(task) = conn.task.take() {
+        for connection in &mut self.connections {
+            if let Some(task) = connection.task.take() {
                 task.abort();
             }
         }
+    }
+}
+
+struct SupervisorArguments {
+    id: ConnectionId,
+    client_id: String,
+    endpoint: String,
+    auto_reconnect: bool,
+    retry_base: Duration,
+    enable_raw: bool,
+    parsed_capacity: usize,
+    raw_capacity: usize,
+    parsed_tx: broadcast::Sender<MarketFeedEvent>,
+    raw_tx: Option<broadcast::Sender<Bytes>>,
+    lifecycle_tx: broadcast::Sender<ManagerLifecycleEvent>,
+    health_tx: watch::Sender<ConnectionHealth>,
+    credentials_rx: watch::Receiver<Credentials>,
+    command_rx: mpsc::Receiver<SupervisorCommand>,
+    previous_close: Arc<StdMutex<HashMap<(u8, u32), MarketFeedEvent>>>,
+    desired: DesiredSubscriptions,
+    generation: u64,
+}
+
+struct Reporter {
+    snapshot: ConnectionHealth,
+    health_tx: watch::Sender<ConnectionHealth>,
+    lifecycle_tx: broadcast::Sender<ManagerLifecycleEvent>,
+}
+
+impl Reporter {
+    fn publish(&self) {
+        let _ = self.health_tx.send(self.snapshot.clone());
+    }
+
+    fn state(&mut self, state: ConnectionLifecycle) {
+        if self.snapshot.lifecycle != state {
+            self.snapshot.lifecycle = state;
+            self.snapshot.last_state_change_at = SystemTime::now();
+            let _ = self.lifecycle_tx.send(ManagerLifecycleEvent::StateChanged {
+                id: self.snapshot.id,
+                state,
+            });
+        }
+        self.publish();
+    }
+
+    fn error(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        self.snapshot.last_error = Some(error.clone());
+        let _ = self.lifecycle_tx.send(ManagerLifecycleEvent::Error {
+            id: self.snapshot.id,
+            error,
+        });
+        self.publish();
+    }
+
+    fn readiness_pending(&mut self) {
+        if self.snapshot.data_quality != MarketDataQuality::GapDetected {
+            self.snapshot.data_quality = if self.snapshot.instrument_count == 0 {
+                MarketDataQuality::Unavailable
+            } else {
+                MarketDataQuality::ReadinessPending
+            };
+        }
+        self.publish();
+    }
+
+    fn valid_data(&mut self) {
+        self.snapshot.data_live = true;
+        if self.snapshot.data_quality != MarketDataQuality::GapDetected {
+            self.snapshot.data_quality = MarketDataQuality::Current;
+            self.state(ConnectionLifecycle::Live);
+        } else {
+            self.state(ConnectionLifecycle::Degraded);
+        }
+    }
+
+    fn gap(&mut self, cause: GapCause) {
+        self.snapshot.data_quality = MarketDataQuality::GapDetected;
+        self.snapshot.gap_cause = Some(cause.clone());
+        self.snapshot.gap_detected_at = Some(SystemTime::now());
+        self.snapshot.gap_count = self.snapshot.gap_count.saturating_add(1);
+        let _ = self.lifecycle_tx.send(ManagerLifecycleEvent::GapDetected {
+            id: self.snapshot.id,
+            cause,
+        });
+        self.state(ConnectionLifecycle::Degraded);
+    }
+
+    fn readiness_failure(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        self.snapshot.last_error = Some(error.clone());
+        let _ = self
+            .lifecycle_tx
+            .send(ManagerLifecycleEvent::ReadinessFailure {
+                id: self.snapshot.id,
+                error,
+            });
+        self.readiness_pending();
+        self.state(ConnectionLifecycle::Degraded);
+    }
+
+    fn acknowledge_gap(&mut self) -> std::result::Result<(), String> {
+        if self.snapshot.data_quality != MarketDataQuality::GapDetected {
+            return Ok(());
+        }
+        if !self.snapshot.data_live {
+            return Err(format!(
+                "{} gap can be acknowledged only after the replacement transport is data-live",
+                self.snapshot.id
+            ));
+        }
+        self.snapshot.gap_cause = None;
+        self.snapshot.gap_detected_at = None;
+        self.snapshot.data_quality = if self.snapshot.data_live {
+            MarketDataQuality::Current
+        } else if self.snapshot.instrument_count > 0 {
+            MarketDataQuality::ReadinessPending
+        } else {
+            MarketDataQuality::Unavailable
+        };
+        let _ = self
+            .lifecycle_tx
+            .send(ManagerLifecycleEvent::GapAcknowledged {
+                id: self.snapshot.id,
+            });
+        let state = if self.snapshot.data_live {
+            ConnectionLifecycle::Live
+        } else if self.snapshot.instrument_count > 0 {
+            self.snapshot.lifecycle
+        } else {
+            ConnectionLifecycle::Idle
+        };
+        self.state(state);
+        Ok(())
+    }
+}
+
+enum ConnectedOutcome {
+    Retry,
+    WaitForCredential(u64),
+    Blocked,
+    Idle,
+    Shutdown,
+}
+
+async fn supervisor(mut args: SupervisorArguments) {
+    let mut reporter = Reporter {
+        snapshot: ConnectionHealth::new(args.id),
+        health_tx: args.health_tx.clone(),
+        lifecycle_tx: args.lifecycle_tx.clone(),
+    };
+    reporter.snapshot.is_alive = true;
+    reporter.snapshot.instrument_count = args.desired.len();
+    reporter.snapshot.desired_generation = args.generation;
+    reporter.readiness_pending();
+    reporter.state(ConnectionLifecycle::Idle);
+
+    let mut retry_attempt = 0_u64;
+    let mut jitter_state = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(args.id.0);
+    let mut connected_once = false;
+    let mut ever_live = false;
+    let mut shutdown_error = None;
+
+    'owner: loop {
+        if args.desired.is_empty() {
+            reporter.snapshot.transport_connected = false;
+            reporter.snapshot.data_live = false;
+            reporter.snapshot.retry_at = None;
+            reporter.readiness_pending();
+            reporter.state(ConnectionLifecycle::Idle);
+            match wait_for_change(&mut args, &mut reporter, WaitCondition::Forever).await {
+                WaitOutcome::Changed => continue,
+                WaitOutcome::Shutdown => break 'owner,
+            }
+        }
+
+        let connection_credential = args.credentials_rx.borrow().clone();
+        let connection_credential_version = connection_credential.version;
+        reporter.snapshot.credential_version = connection_credential_version;
+        reporter.snapshot.retry_count = retry_attempt;
+        reporter.readiness_pending();
+        reporter.state(ConnectionLifecycle::Connecting);
+        let url = match connection_url(
+            &args.endpoint,
+            &args.client_id,
+            &connection_credential.token,
+        ) {
+            Ok(url) => url,
+            Err(error) => {
+                reporter.error(format!("invalid market-feed endpoint: {error}"));
+                reporter.state(ConnectionLifecycle::Blocked);
+                if matches!(
+                    wait_for_change(&mut args, &mut reporter, WaitCondition::Forever).await,
+                    WaitOutcome::Shutdown
+                ) {
+                    break;
+                }
+                continue;
+            }
+        };
+        // The URL now owns the encoded query value; do not retain an extra
+        // access-token String for the entire lifetime of the live transport.
+        drop(connection_credential);
+
+        let connection = connect_with_commands(&url, &mut args, &mut reporter).await;
+        let mut socket = match connection {
+            ConnectOutcome::Connected(socket) => socket,
+            ConnectOutcome::Changed => continue,
+            ConnectOutcome::Shutdown => break,
+            ConnectOutcome::Failed(error) => {
+                reporter.error(error.clone());
+                if !ever_live {
+                    reporter.readiness_failure(error);
+                }
+                retry_attempt = retry_attempt.saturating_add(1);
+                if !args.auto_reconnect {
+                    reporter.state(ConnectionLifecycle::Blocked);
+                    if matches!(
+                        wait_for_change(&mut args, &mut reporter, WaitCondition::Forever).await,
+                        WaitOutcome::Shutdown
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                let delay = jitter_delay(args.retry_base, retry_attempt, &mut jitter_state);
+                schedule_retry(&mut reporter, retry_attempt, delay);
+                match wait_for_change(&mut args, &mut reporter, WaitCondition::Delay(delay)).await {
+                    WaitOutcome::Changed => continue,
+                    WaitOutcome::Shutdown => break,
+                }
+            }
+        };
+
+        if connected_once {
+            reporter.snapshot.reconnect_count = reporter.snapshot.reconnect_count.saturating_add(1);
+        }
+        connected_once = true;
+        reporter.snapshot.transport_connected = true;
+        reporter.snapshot.data_live = false;
+        reporter.snapshot.applied_generation = 0;
+        reporter.snapshot.retry_at = None;
+        reporter.readiness_pending();
+        let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::Connected {
+            id: args.id,
+            credential_version: connection_credential_version,
+        });
+        reporter.publish();
+
+        match run_connected(
+            &mut socket,
+            &mut args,
+            &mut reporter,
+            &mut retry_attempt,
+            &mut ever_live,
+            connection_credential_version,
+        )
+        .await
+        {
+            ConnectedOutcome::Shutdown => {
+                if let Err(error) = graceful_disconnect(&mut socket).await {
+                    reporter.error(error.clone());
+                    shutdown_error = Some(error);
+                }
+                break 'owner;
+            }
+            ConnectedOutcome::Idle => {
+                if let Err(error) = graceful_disconnect(&mut socket).await {
+                    reporter.error(error);
+                }
+                retry_attempt = 0;
+                ever_live = false;
+                reporter.readiness_pending();
+                continue;
+            }
+            ConnectedOutcome::WaitForCredential(version) => {
+                reporter.snapshot.transport_connected = false;
+                reporter.snapshot.data_live = false;
+                reporter.readiness_pending();
+                reporter.state(ConnectionLifecycle::Blocked);
+                if matches!(
+                    wait_for_change(
+                        &mut args,
+                        &mut reporter,
+                        WaitCondition::CredentialAfter(version),
+                    )
+                    .await,
+                    WaitOutcome::Shutdown
+                ) {
+                    break;
+                }
+                retry_attempt = 0;
+                continue;
+            }
+            ConnectedOutcome::Blocked => {
+                reporter.snapshot.transport_connected = false;
+                reporter.snapshot.data_live = false;
+                reporter.readiness_pending();
+                reporter.state(ConnectionLifecycle::Blocked);
+                if matches!(
+                    wait_for_change(&mut args, &mut reporter, WaitCondition::Forever).await,
+                    WaitOutcome::Shutdown
+                ) {
+                    break;
+                }
+                continue;
+            }
+            ConnectedOutcome::Retry => {
+                reporter.snapshot.transport_connected = false;
+                reporter.snapshot.data_live = false;
+                reporter.snapshot.applied_generation = 0;
+                reporter.readiness_pending();
+                retry_attempt = retry_attempt.saturating_add(1);
+                if !args.auto_reconnect {
+                    reporter.state(ConnectionLifecycle::Blocked);
+                    if matches!(
+                        wait_for_change(&mut args, &mut reporter, WaitCondition::Forever).await,
+                        WaitOutcome::Shutdown
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                let delay = jitter_delay(args.retry_base, retry_attempt, &mut jitter_state);
+                schedule_retry(&mut reporter, retry_attempt, delay);
+                if matches!(
+                    wait_for_change(&mut args, &mut reporter, WaitCondition::Delay(delay)).await,
+                    WaitOutcome::Shutdown
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+
+    reporter.snapshot.is_alive = false;
+    reporter.snapshot.transport_connected = false;
+    reporter.snapshot.data_live = false;
+    reporter.readiness_pending();
+    reporter.state(ConnectionLifecycle::Stopped);
+    let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::Stopped {
+        id: args.id,
+        error: shutdown_error,
+    });
+}
+
+enum WaitOutcome {
+    Changed,
+    Shutdown,
+}
+
+enum WaitCondition {
+    Forever,
+    Delay(Duration),
+    CredentialAfter(u64),
+}
+
+async fn wait_for_change(
+    args: &mut SupervisorArguments,
+    reporter: &mut Reporter,
+    condition: WaitCondition,
+) -> WaitOutcome {
+    match condition {
+        WaitCondition::CredentialAfter(version) => loop {
+            // A replacement may have been published (and observed by the
+            // connected loop) before Dhan's authentication-disconnect packet
+            // arrived. Do not wait for yet another watch notification when the
+            // credential needed for the next attempt is already available.
+            if args.credentials_rx.borrow().version > version {
+                return WaitOutcome::Changed;
+            }
+            tokio::select! {
+                command = args.command_rx.recv() => {
+                    match handle_command(command, args, reporter) {
+                        CommandResult::Changed => return WaitOutcome::Changed,
+                        CommandResult::Shutdown => return WaitOutcome::Shutdown,
+                    }
+                }
+                changed = args.credentials_rx.changed() => {
+                    if changed.is_err() || args.credentials_rx.borrow().version > version {
+                        return WaitOutcome::Changed;
+                    }
+                }
+            }
+        },
+        WaitCondition::Delay(delay) => {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => WaitOutcome::Changed,
+                command = args.command_rx.recv() => match handle_command(command, args, reporter) {
+                    CommandResult::Changed => WaitOutcome::Changed,
+                    CommandResult::Shutdown => WaitOutcome::Shutdown,
+                },
+                _ = args.credentials_rx.changed() => WaitOutcome::Changed,
+            }
+        }
+        WaitCondition::Forever => {
+            tokio::select! {
+                command = args.command_rx.recv() => match handle_command(command, args, reporter) {
+                    CommandResult::Changed => WaitOutcome::Changed,
+                    CommandResult::Shutdown => WaitOutcome::Shutdown,
+                },
+                _ = args.credentials_rx.changed() => WaitOutcome::Changed,
+            }
+        }
+    }
+}
+
+enum CommandResult {
+    Changed,
+    Shutdown,
+}
+
+fn handle_command(
+    command: Option<SupervisorCommand>,
+    args: &mut SupervisorArguments,
+    reporter: &mut Reporter,
+) -> CommandResult {
+    match command {
+        Some(SupervisorCommand::ReplaceDesired {
+            generation,
+            desired,
+            acknowledged,
+        }) => {
+            args.generation = generation;
+            args.desired = desired;
+            reporter.snapshot.instrument_count = args.desired.len();
+            reporter.snapshot.desired_generation = generation;
+            reporter.publish();
+            let _ = acknowledged.send(());
+            CommandResult::Changed
+        }
+        Some(SupervisorCommand::AcknowledgeGap { acknowledged }) => {
+            let result = reporter.acknowledge_gap();
+            let _ = acknowledged.send(result);
+            CommandResult::Changed
+        }
+        Some(SupervisorCommand::Shutdown { acknowledged }) => {
+            let _ = acknowledged.send(());
+            CommandResult::Shutdown
+        }
+        None => CommandResult::Shutdown,
+    }
+}
+
+enum ConnectOutcome {
+    Connected(Box<WsStream>),
+    Changed,
+    Shutdown,
+    Failed(String),
+}
+
+async fn connect_with_commands(
+    url: &Url,
+    args: &mut SupervisorArguments,
+    reporter: &mut Reporter,
+) -> ConnectOutcome {
+    tokio::select! {
+        result = timeout(CONNECT_TIMEOUT, connect_async(url.as_str())) => {
+            match result {
+                Ok(Ok((socket, _))) => ConnectOutcome::Connected(Box::new(socket)),
+                Ok(Err(error)) => ConnectOutcome::Failed(format!("WebSocket connect failed: {error}")),
+                Err(_) => ConnectOutcome::Failed("WebSocket connect timed out".into()),
+            }
+        }
+        command = args.command_rx.recv() => match handle_command(command, args, reporter) {
+            CommandResult::Changed => ConnectOutcome::Changed,
+            CommandResult::Shutdown => ConnectOutcome::Shutdown,
+        },
+        _ = args.credentials_rx.changed() => ConnectOutcome::Changed,
+    }
+}
+
+fn connection_url(endpoint: &str, client_id: &str, token: &str) -> Result<Url> {
+    let mut url = Url::parse(endpoint)?;
+    url.query_pairs_mut()
+        .append_pair("version", "2")
+        .append_pair("token", token)
+        .append_pair("clientId", client_id)
+        .append_pair("authType", "2");
+    Ok(url)
+}
+
+async fn run_connected(
+    socket: &mut WsStream,
+    args: &mut SupervisorArguments,
+    reporter: &mut Reporter,
+    retry_attempt: &mut u64,
+    ever_live: &mut bool,
+    connection_credential_version: u64,
+) -> ConnectedOutcome {
+    let mut applied = DesiredSubscriptions::new();
+    let connected_at = Instant::now();
+
+    loop {
+        reporter.state(ConnectionLifecycle::Resubscribing);
+        if let Err(error) = reconcile(socket, &applied, &args.desired).await {
+            let error = format!("subscription reconciliation failed: {error}");
+            reporter.error(error.clone());
+            record_transport_loss(reporter, *ever_live, None, error);
+            return ConnectedOutcome::Retry;
+        }
+        applied = args.desired.clone();
+        reporter.snapshot.applied_generation = args.generation;
+        reporter.readiness_pending();
+        reporter.state(ConnectionLifecycle::ReadinessPending);
+
+        let inactivity = tokio::time::sleep(NO_FRAME_TIMEOUT);
+        tokio::pin!(inactivity);
+        let readiness = tokio::time::sleep(NO_FRAME_TIMEOUT);
+        tokio::pin!(readiness);
+        loop {
+            tokio::select! {
+                command = args.command_rx.recv() => {
+                    match command {
+                        Some(SupervisorCommand::ReplaceDesired { generation, desired, acknowledged }) => {
+                            args.generation = generation;
+                            args.desired = desired;
+                            reporter.snapshot.instrument_count = args.desired.len();
+                            reporter.snapshot.desired_generation = generation;
+                            reporter.publish();
+                            let _ = acknowledged.send(());
+                            if args.desired.is_empty() {
+                                return ConnectedOutcome::Idle;
+                            }
+                            break;
+                        }
+                        Some(SupervisorCommand::AcknowledgeGap { acknowledged }) => {
+                            let result = reporter.acknowledge_gap();
+                            let _ = acknowledged.send(result);
+                        }
+                        Some(SupervisorCommand::Shutdown { acknowledged }) => {
+                            // The manager waits for this acknowledgement only as a
+                            // signal that cancellation reached the owner. The task
+                            // join proves graceful close completion.
+                            let _ = acknowledged.send(());
+                            reporter.state(ConnectionLifecycle::Closing);
+                            return ConnectedOutcome::Shutdown;
+                        }
+                        None => return ConnectedOutcome::Shutdown,
+                    }
+                }
+                changed = args.credentials_rx.changed() => {
+                    if changed.is_err() {
+                        return ConnectedOutcome::Shutdown;
+                    }
+                    reporter.snapshot.credential_version = args.credentials_rx.borrow().version;
+                    reporter.publish();
+                }
+                _ = &mut inactivity => {
+                    let error = "market-feed inactivity deadline exceeded".to_owned();
+                    reporter.error(error.clone());
+                    record_transport_loss(reporter, *ever_live, None, error);
+                    return ConnectedOutcome::Retry;
+                }
+                _ = &mut readiness, if !reporter.snapshot.data_live => {
+                    let error = "market-feed readiness deadline exceeded without valid data".to_owned();
+                    reporter.error(error.clone());
+                    record_transport_loss(reporter, *ever_live, None, error);
+                    return ConnectedOutcome::Retry;
+                }
+                message = socket.next() => {
+                    let now = SystemTime::now();
+                    reporter.snapshot.last_frame_at = Some(now);
+                    inactivity.as_mut().reset(Instant::now() + NO_FRAME_TIMEOUT);
+                    match message {
+                        Some(Ok(Message::Binary(data))) => {
+                            reporter.snapshot.last_data_at = Some(now);
+                            if connected_at.elapsed() >= STABLE_RETRY_RESET {
+                                *retry_attempt = 0;
+                                reporter.snapshot.retry_count = 0;
+                            }
+                            if args.enable_raw {
+                                if let Some(sender) = &args.raw_tx {
+                                    detect_lag(
+                                        sender,
+                                        args.raw_capacity,
+                                        args.id,
+                                        &args.lifecycle_tx,
+                                        reporter,
+                                    );
+                                    let _ = sender.send(Bytes::copy_from_slice(&data));
+                                }
+                            }
+                            match parse_packet(&data) {
+                                Ok(event) => {
+                                    let has_receiver = args.parsed_tx.receiver_count() > 0;
+                                    if let MarketFeedEvent::PrevClose { header, .. } = &event {
+                                        args.previous_close
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .insert((header.exchange_segment_raw, header.security_id), event.clone());
+                                        if !has_receiver {
+                                            let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
+                                                id: args.id,
+                                                event: "previous-close-cached",
+                                            });
+                                        }
+                                    } else if !has_receiver {
+                                        let event_name = market_event_name(&event);
+                                        let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
+                                            id: args.id,
+                                            event: event_name,
+                                        });
+                                        reporter.gap(GapCause::NoReceiver { event: event_name });
+                                    }
+                                    let dhan_disconnect = match &event {
+                                        MarketFeedEvent::Disconnect { reason_code, .. } => Some(*reason_code),
+                                        _ => None,
+                                    };
+                                    detect_lag(
+                                        &args.parsed_tx,
+                                        args.parsed_capacity,
+                                        args.id,
+                                        &args.lifecycle_tx,
+                                        reporter,
+                                    );
+                                    let _ = args.parsed_tx.send(event);
+                                    if let Some(reason_code) = dhan_disconnect {
+                                        let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::DhanDisconnected {
+                                            id: args.id,
+                                            reason_code,
+                                        });
+                                        let error = format!("Dhan disconnected feed with reason {reason_code}");
+                                        reporter.error(error.clone());
+                                        record_transport_loss(reporter, *ever_live, None, error);
+                                        return match reason_code {
+                                            807..=809 => ConnectedOutcome::WaitForCredential(connection_credential_version),
+                                            804 | 806 | 810..=814 => ConnectedOutcome::Blocked,
+                                            _ => ConnectedOutcome::Retry,
+                                        };
+                                    }
+                                    *ever_live = true;
+                                    reporter.valid_data();
+                                }
+                                Err(error) => {
+                                    let error = error.to_string();
+                                    reporter.snapshot.parser_error_count = reporter.snapshot.parser_error_count.saturating_add(1);
+                                    reporter.snapshot.last_error = Some(error.clone());
+                                    let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::ParseError {
+                                        id: args.id,
+                                        error: error.clone(),
+                                    });
+                                    if *ever_live {
+                                        reporter.gap(GapCause::ParseError { error });
+                                    } else {
+                                        reporter.readiness_failure(error);
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            let (close_code, reason) = frame
+                                .map(|frame| (Some(u16::from(frame.code)), frame.reason.to_string()))
+                                .unwrap_or((None, String::new()));
+                            let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::Disconnected {
+                                id: args.id,
+                                close_code,
+                                reason: reason.clone(),
+                            });
+                            record_transport_loss(
+                                reporter,
+                                *ever_live,
+                                close_code,
+                                if reason.is_empty() {
+                                    "WebSocket peer closed the connection".to_owned()
+                                } else {
+                                    reason
+                                },
+                            );
+                            return ConnectedOutcome::Retry;
+                        }
+                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Text(_))) | Some(Ok(Message::Frame(_))) => {}
+                        Some(Err(error)) => {
+                            let error = format!("WebSocket read failed: {error}");
+                            reporter.error(error.clone());
+                            record_transport_loss(reporter, *ever_live, None, error);
+                            return ConnectedOutcome::Retry;
+                        }
+                        None => {
+                            let error = "WebSocket stream ended".to_owned();
+                            reporter.error(error.clone());
+                            record_transport_loss(reporter, *ever_live, None, error);
+                            return ConnectedOutcome::Retry;
+                        }
+                    }
+                    reporter.publish();
+                }
+            }
+        }
+    }
+}
+
+fn market_event_name(event: &MarketFeedEvent) -> &'static str {
+    match event {
+        MarketFeedEvent::Ticker { .. } => "ticker",
+        MarketFeedEvent::PrevClose { .. } => "previous-close",
+        MarketFeedEvent::Quote { .. } => "quote",
+        MarketFeedEvent::OI { .. } => "open-interest",
+        MarketFeedEvent::Full { .. } => "full",
+        MarketFeedEvent::MarketStatus { .. } => "market-status",
+        MarketFeedEvent::Index { .. } => "index",
+        MarketFeedEvent::Disconnect { .. } => "disconnect",
+    }
+}
+
+fn detect_lag<T: Clone>(
+    sender: &broadcast::Sender<T>,
+    capacity: usize,
+    id: ConnectionId,
+    lifecycle_tx: &broadcast::Sender<ManagerLifecycleEvent>,
+    reporter: &mut Reporter,
+) {
+    if sender.receiver_count() > 0 && sender.len() >= capacity {
+        reporter.snapshot.lagged_event_count =
+            reporter.snapshot.lagged_event_count.saturating_add(1);
+        let _ = lifecycle_tx.send(ManagerLifecycleEvent::ReceiverLag { id, dropped: 1 });
+        reporter.gap(GapCause::ReceiverLag { dropped: 1 });
+    }
+}
+
+fn record_transport_loss(
+    reporter: &mut Reporter,
+    ever_live: bool,
+    close_code: Option<u16>,
+    reason: String,
+) {
+    if ever_live {
+        reporter.gap(GapCause::Disconnect { close_code, reason });
+    } else {
+        reporter.readiness_failure(reason);
+    }
+}
+
+fn desired_equal(left: &DesiredSubscriptions, right: &DesiredSubscriptions) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, (left_instrument, left_mode))| {
+            right
+                .get(key)
+                .is_some_and(|(right_instrument, right_mode)| {
+                    left_mode == right_mode
+                        && left_instrument.ExchangeSegment == right_instrument.ExchangeSegment
+                        && left_instrument.SecurityId == right_instrument.SecurityId
+                })
+        })
+}
+
+async fn reconcile(
+    socket: &mut WsStream,
+    applied: &DesiredSubscriptions,
+    desired: &DesiredSubscriptions,
+) -> std::result::Result<(), String> {
+    let mut unsubscribe: HashMap<u8, Vec<Instrument>> = HashMap::new();
+    let mut subscribe: HashMap<u8, Vec<Instrument>> = HashMap::new();
+    let keys: HashSet<_> = applied.keys().chain(desired.keys()).cloned().collect();
+
+    for key in keys {
+        match (applied.get(&key), desired.get(&key)) {
+            (Some((old_instrument, old_mode)), Some((new_instrument, new_mode)))
+                if old_mode != new_mode =>
+            {
+                unsubscribe
+                    .entry(unsubscribe_code(*old_mode))
+                    .or_default()
+                    .push(old_instrument.clone());
+                subscribe
+                    .entry(*new_mode as u8)
+                    .or_default()
+                    .push(new_instrument.clone());
+            }
+            (Some((old_instrument, old_mode)), None) => {
+                unsubscribe
+                    .entry(unsubscribe_code(*old_mode))
+                    .or_default()
+                    .push(old_instrument.clone());
+            }
+            (None, Some((instrument, mode))) => {
+                subscribe
+                    .entry(*mode as u8)
+                    .or_default()
+                    .push(instrument.clone());
+            }
+            _ => {}
+        }
+    }
+
+    for (request_code, instruments) in unsubscribe.into_iter().chain(subscribe) {
+        for chunk in instruments.chunks(DHAN_CONTROL_FRAME_LIMIT) {
+            let request = FeedSubscribeRequest {
+                RequestCode: request_code,
+                InstrumentCount: chunk.len(),
+                InstrumentList: chunk.to_vec(),
+            };
+            let json = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+            write_message(socket, Message::Text(json.into())).await?;
+        }
+    }
+    timeout(WRITE_TIMEOUT, socket.flush())
+        .await
+        .map_err(|_| "WebSocket flush timed out".to_owned())?
+        .map_err(|error| format!("WebSocket flush failed: {error}"))
+}
+
+async fn write_message(socket: &mut WsStream, message: Message) -> std::result::Result<(), String> {
+    timeout(WRITE_TIMEOUT, socket.send(message))
+        .await
+        .map_err(|_| "WebSocket write timed out".to_owned())?
+        .map_err(|error| format!("WebSocket write failed: {error}"))
+}
+
+async fn graceful_disconnect(socket: &mut WsStream) -> std::result::Result<(), String> {
+    let request = serde_json::to_string(&FeedDisconnectRequest { RequestCode: 12 })
+        .map_err(|error| error.to_string())?;
+    write_message(socket, Message::Text(request.into())).await?;
+    timeout(WRITE_TIMEOUT, socket.flush())
+        .await
+        .map_err(|_| "disconnect flush timed out".to_owned())?
+        .map_err(|error| format!("disconnect flush failed: {error}"))?;
+    write_message(socket, Message::Close(None)).await?;
+
+    let close = async {
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    };
+    timeout(CLOSE_TIMEOUT, close)
+        .await
+        .map_err(|_| "WebSocket close handshake timed out".to_owned())?;
+    Ok(())
+}
+
+fn schedule_retry(reporter: &mut Reporter, attempt: u64, delay: Duration) {
+    reporter.snapshot.retry_count = attempt;
+    reporter.snapshot.retry_at = SystemTime::now().checked_add(delay);
+    reporter.state(ConnectionLifecycle::Backoff);
+    let _ = reporter
+        .lifecycle_tx
+        .send(ManagerLifecycleEvent::RetryScheduled {
+            id: reporter.snapshot.id,
+            attempt,
+            delay,
+        });
+}
+
+fn jitter_delay(base: Duration, attempt: u64, state: &mut u64) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(31) as u32;
+    let cap_millis = base
+        .as_millis()
+        .saturating_mul(1_u128 << exponent)
+        .min(MAX_RETRY_BASE.as_millis()) as u64;
+    if cap_millis == 0 {
+        return Duration::ZERO;
+    }
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    Duration::from_millis(*state % (cap_millis + 1))
+}
+
+fn validate_subscribe_mode(mode: FeedRequestCode) -> Result<()> {
+    match mode {
+        FeedRequestCode::SubscribeTicker
+        | FeedRequestCode::SubscribeQuote
+        | FeedRequestCode::SubscribeFull => Ok(()),
+        _ => Err(DhanError::InvalidArgument(
+            "standard market feed accepts only ticker, quote, or full subscription modes".into(),
+        )),
+    }
+}
+
+fn validate_unsubscribe_mode(mode: FeedRequestCode) -> Result<()> {
+    match mode {
+        FeedRequestCode::UnsubscribeTicker
+        | FeedRequestCode::UnsubscribeQuote
+        | FeedRequestCode::UnsubscribeFull => Ok(()),
+        _ => Err(DhanError::InvalidArgument(
+            "unsubscribe requires a standard ticker, quote, or full unsubscribe code".into(),
+        )),
+    }
+}
+
+fn validate_instruments(instruments: &[Instrument]) -> Result<()> {
+    let mut unique = HashSet::with_capacity(instruments.len());
+    for (index, instrument) in instruments.iter().enumerate() {
+        if !matches!(
+            instrument.ExchangeSegment.as_str(),
+            "IDX_I"
+                | "NSE_EQ"
+                | "NSE_FNO"
+                | "NSE_CURRENCY"
+                | "BSE_EQ"
+                | "MCX_COMM"
+                | "BSE_CURRENCY"
+                | "BSE_FNO"
+        ) {
+            return Err(DhanError::InvalidArgument(format!(
+                "instrument {index} has an unsupported standard-feed exchange segment"
+            )));
+        }
+        if instrument.SecurityId.trim().is_empty() {
+            return Err(DhanError::InvalidArgument(format!(
+                "instrument {index} requires a nonblank security ID"
+            )));
+        }
+        if instrument.SecurityId.parse::<u32>().is_err() {
+            return Err(DhanError::InvalidArgument(format!(
+                "instrument {index} security ID must be an unsigned 32-bit integer"
+            )));
+        }
+        // Exact duplicates are intentionally idempotent. The desired map has
+        // one mode per key, so a batch can never create competing modes.
+        unique.insert(InstrumentKey::from(instrument));
+    }
+    Ok(())
+}
+
+fn unsubscribe_code(mode: FeedRequestCode) -> u8 {
+    match mode {
+        FeedRequestCode::SubscribeTicker => FeedRequestCode::UnsubscribeTicker as u8,
+        FeedRequestCode::SubscribeQuote => FeedRequestCode::UnsubscribeQuote as u8,
+        FeedRequestCode::SubscribeFull => FeedRequestCode::UnsubscribeFull as u8,
+        _ => unreachable!("desired state contains only validated subscription modes"),
     }
 }

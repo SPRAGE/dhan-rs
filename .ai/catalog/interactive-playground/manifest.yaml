@@ -1,0 +1,27 @@
+version: 1
+name: interactive-playground
+managed_by: dev-template
+audience: optional
+requires_capabilities: [plan, implement, test]
+budgets:
+  entry_tokens: 600
+  total_tokens: 1000
+references:
+  - references/patterns.md
+package:
+  - SKILL.md
+  - manifest.yaml
+  - references/*.md
+triggers:
+  positive:
+    - Build an interactive playground for choosing card styles.
+    - Make a single-file explorer for this query builder.
+    - Create a visual tool for reviewing these document suggestions.
+    - Let me adjust these layout options and copy a prompt.
+    - Build an offline code-map playground with comments.
+  negative:
+    - Implement the final card component directly.
+    - Draw a static architecture diagram.
+    - Review this diff in the conversation.
+    - Add one slider to the existing application.
+    - Explain these layout options.

@@ -1,0 +1,23 @@
+version: 1
+name: data-visualization
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, plan, implement, test, review.code]
+budgets:
+  entry_tokens: 700
+  total_tokens: 900
+references: []
+package: [SKILL.md, manifest.yaml]
+triggers:
+  positive:
+    - Choose and implement honest visualizations for this analytics dashboard.
+    - Show uncertainty, missing values, and live updates accessibly.
+    - Redesign this misleading chart around the user's decision.
+    - Make this high-cardinality visualization performant and readable.
+    - Validate that dashboard aggregations match the source data.
+  negative:
+    - Style a marketing hero section.
+    - Fix an API authentication bug.
+    - Change one chart title.
+    - Export an existing table to CSV.
+    - Explain a single known metric definition.

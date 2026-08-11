@@ -1,0 +1,23 @@
+version: 1
+name: performance-engineering
+managed_by: dev-template
+audience: optional
+requires_capabilities: [explore, plan, implement, test, review.code]
+budgets:
+  entry_tokens: 700
+  total_tokens: 1500
+references: [references/measurement.md]
+package: [SKILL.md, manifest.yaml, references/*.md]
+triggers:
+  positive:
+    - Reduce this dashboard's p95 interaction latency with evidence.
+    - Profile the service and fix its throughput bottleneck.
+    - Establish a repeatable performance budget and regression test.
+    - Diagnose why memory grows under sustained load.
+    - Optimize this query path without changing its results.
+  negative:
+    - Make the interface feel nicer without a performance complaint.
+    - Rename a slow-sounding function.
+    - Minify this already-budgeted asset.
+    - Guess which database index we need without measurements.
+    - Run one stopwatch measurement and declare success.

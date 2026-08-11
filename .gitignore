@@ -1,4 +1,5 @@
 .direnv/
+.env.sandbox
 target/
 result
 

@@ -1,0 +1,23 @@
+version: 1
+name: agent-evaluation
+managed_by: dev-template
+audience: maintainer
+requires_capabilities: [explore, plan, test, review.code]
+budgets:
+  entry_tokens: 650
+  total_tokens: 1400
+references: [references/benchmark-design.md]
+package: [SKILL.md, manifest.yaml, references/*.md]
+triggers:
+  positive:
+    - Benchmark whether this skill actually improves task outcomes.
+    - Compare the four-role runtime against the previous orchestration.
+    - Design a held-out evaluation for our agent guidance.
+    - Measure trigger precision, token cost, and regressions for this capability.
+    - Decide whether this workflow deserves to become a default skill.
+  negative:
+    - Run the normal project test suite once.
+    - Review this product diff.
+    - Estimate tokens from a file size only.
+    - Add one deterministic compiler fixture.
+    - Explain how the runtime routes agents.

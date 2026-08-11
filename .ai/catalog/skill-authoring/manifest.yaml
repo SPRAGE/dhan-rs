@@ -1,0 +1,26 @@
+version: 1
+name: skill-authoring
+managed_by: dev-template
+audience: maintainer
+requires_capabilities: [explore, plan, implement, test, review.code]
+budgets:
+  entry_tokens: 600
+  total_tokens: 3200
+references: []
+package:
+  - SKILL.md
+  - manifest.yaml
+  - scripts/*.py
+triggers:
+  positive:
+    - Create a reusable skill for our release workflow.
+    - Improve this skill's trigger precision.
+    - Validate and package the skill directory.
+    - Separate deterministic hook behavior from this skill.
+    - Audit this skill for progressive disclosure and token cost.
+  negative:
+    - Follow the release workflow once.
+    - Fix a product bug.
+    - Add a repository instruction.
+    - Run the formatter.
+    - Install an existing skill.

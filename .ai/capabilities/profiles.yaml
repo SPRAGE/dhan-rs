@@ -1,0 +1,14 @@
+version: 2
+profiles:
+  read_only:
+    filesystem: read
+    write: false
+    network: false
+  read_network:
+    filesystem: read
+    write: false
+    network: true
+  workspace_write:
+    filesystem: workspace
+    write: true
+    network: false

@@ -112,6 +112,7 @@ pub struct SuperOrderDetail {
     pub update_time: Option<String>,
     pub exchange_time: Option<String>,
     pub oms_error_description: Option<String>,
+    pub algo_id: Option<String>,
     #[serde(default)]
     pub average_traded_price: Option<f64>,
     #[serde(default)]

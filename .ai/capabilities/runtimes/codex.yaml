@@ -1,0 +1,31 @@
+version: 2
+runtime: codex
+models:
+  deep:
+    id: gpt-5.6-sol
+  balanced:
+    id: gpt-5.6-terra
+  fast:
+    id: gpt-5.6-luna
+profiles:
+  read_only:
+    sandbox_mode: read-only
+    web_search: disabled
+  read_network:
+    sandbox_mode: read-only
+    web_search: live
+  workspace_write:
+    sandbox_mode: workspace-write
+    web_search: disabled
+orchestration:
+  main_reasoning_effort: medium
+  max_threads: 4
+  max_depth: 1
+  plan_mode_reasoning_effort: high
+reasoning_effort:
+  researcher: medium
+  reviewer: high
+  scout: low
+  worker: medium
+agent_extensions: {}
+fallback: inline_and_report_limitation

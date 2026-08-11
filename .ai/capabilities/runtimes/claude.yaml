@@ -1,0 +1,25 @@
+version: 2
+runtime: claude
+models:
+  deep:
+    id: opus
+  balanced:
+    id: sonnet
+  fast:
+    id: haiku
+profiles:
+  read_only:
+    permission_mode: plan
+    tools: [Read, Grep, Glob, Bash]
+  read_network:
+    permission_mode: plan
+    tools: [Read, Grep, Glob, WebFetch, WebSearch]
+  workspace_write:
+    permission_mode: acceptEdits
+    tools: [Read, Edit, Write, Grep, Glob, Bash]
+max_turns:
+  researcher: 8
+  reviewer: 16
+  scout: 8
+  worker: 18
+fallback: inline_and_report_limitation

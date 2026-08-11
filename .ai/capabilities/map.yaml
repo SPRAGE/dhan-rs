@@ -1,0 +1,52 @@
+version: 2
+capabilities:
+  explore:
+    profile: read_only
+    inputs: [objective, scope, required_evidence]
+    output: exploration_report
+  research:
+    profile: read_network
+    inputs: [objective, repository_facts, configured_sources, constraints, required_evidence]
+    output: research_report
+  plan:
+    profile: read_only
+    inputs: [objective, repository_facts, constraints, success_criteria]
+    output: plan
+  implement:
+    profile: workspace_write
+    inputs: [objective, file_scope, success_criteria, preserved_invariants, required_evidence]
+    output: change_report
+  test:
+    profile: workspace_write
+    inputs: [objective, change_scope, success_criteria, required_evidence]
+    output: change_report
+  review.code:
+    profile: read_only
+    inputs: [objective, diff, success_criteria, preserved_invariants, required_evidence]
+    output: review_report
+  review.security:
+    profile: read_only
+    inputs: [objective, diff, threat_scope, success_criteria, required_evidence]
+    output: review_report
+  document:
+    profile: workspace_write
+    inputs: [objective, audience, verified_behavior, file_scope]
+    output: change_report
+  integrate:
+    profile: workspace_write
+    inputs: [objective, plan, current_diff, success_criteria, preserved_invariants, required_evidence]
+    output: change_report
+
+output_contracts:
+  common:
+    fields: [status, summary, evidence, blockers, next_action]
+  exploration_report:
+    fields: [facts, relevant_paths, risks]
+  research_report:
+    fields: [findings, sources, uncertainty]
+  plan:
+    fields: [assumptions, success_criteria, steps, dependencies, risks, verification]
+  change_report:
+    fields: [files_changed, verification, deviations]
+  review_report:
+    fields: [findings, severity, missing_tests, recommendation]

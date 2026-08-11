@@ -24,6 +24,31 @@ pub struct LedgerEntry {
     pub runbal: Option<String>,
 }
 
+/// Wire shapes observed or published for the ledger endpoint.
+///
+/// The current HTML documentation and linked OpenAPI describe one ledger
+/// object. Older clients expected an array, so both shapes are accepted without
+/// inventing an undocumented envelope.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum LedgerResponse {
+    /// Current documented object response.
+    Entry(LedgerEntry),
+    /// Historical array response retained for compatibility.
+    Entries(Vec<LedgerEntry>),
+}
+
+impl LedgerResponse {
+    /// Convert either supported wire shape into the crate's established list
+    /// representation.
+    pub fn into_entries(self) -> Vec<LedgerEntry> {
+        match self {
+            Self::Entry(entry) => vec![entry],
+            Self::Entries(entries) => entries,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trade History Entry
 // ---------------------------------------------------------------------------

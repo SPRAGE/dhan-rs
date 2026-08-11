@@ -61,6 +61,20 @@ pub enum DhanError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// Reading an HTTP response body failed after the server sent its status.
+    #[error("HTTP response body read failed after {status}: {source}")]
+    ResponseBody {
+        /// Status received before the body read failed.
+        status: reqwest::StatusCode,
+        /// The underlying transport/body-read failure.
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// A credential cannot be represented safely as an HTTP header value.
+    #[error("invalid HTTP header value: {0}")]
+    InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
+
     /// Failed to deserialize a JSON response body.
     #[error("JSON deserialization error: {0}")]
     Json(#[from] serde_json::Error),
