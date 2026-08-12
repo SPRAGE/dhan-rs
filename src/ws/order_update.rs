@@ -1292,6 +1292,9 @@ fn full_jitter(ceiling: Duration) -> Duration {
     if nanos == 0 {
         return Duration::ZERO;
     }
+    // `try_update` is the new name on current toolchains, but retaining the
+    // older spelling preserves this crate's declared Rust 1.85 MSRV.
+    #[allow(deprecated)]
     let seed = JITTER_STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         let mut next = if current == 0 {
             SystemTime::now()

@@ -23,7 +23,7 @@ use url::Url;
 use crate::constants::WS_MARKET_FEED_URL;
 use crate::error::{DhanError, Result};
 use crate::types::enums::FeedRequestCode;
-use crate::ws::market_feed::{Instrument, MarketFeedEvent, parse_packet};
+use crate::ws::market_feed::{Instrument, MAX_PACKETS_PER_MESSAGE, MarketFeedEvent, parse_packets};
 
 const DHAN_MAX_CONNECTIONS: u8 = 5;
 const DHAN_MAX_INSTRUMENTS: usize = 5_000;
@@ -259,7 +259,7 @@ impl Default for DhanFeedConfig {
             max_instruments_per_connection: DHAN_MAX_INSTRUMENTS,
             enable_raw_frames: false,
             reconnect_delay_ms: 250,
-            parsed_channel_capacity: 4_096,
+            parsed_channel_capacity: MAX_PACKETS_PER_MESSAGE,
             raw_channel_capacity: 4_096,
             auto_reconnect: true,
         }
@@ -1520,56 +1520,58 @@ async fn run_connected(
                                     let _ = sender.send(Bytes::copy_from_slice(&data));
                                 }
                             }
-                            match parse_packet(&data) {
-                                Ok(event) => {
+                            match parse_packets(&data) {
+                                Ok(events) => {
                                     let has_receiver = args.parsed_tx.receiver_count() > 0;
-                                    if let MarketFeedEvent::PrevClose { header, .. } = &event {
-                                        args.previous_close
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                            .insert((header.exchange_segment_raw, header.security_id), event.clone());
-                                        if !has_receiver {
+                                    for event in events {
+                                        if let MarketFeedEvent::PrevClose { header, .. } = &event {
+                                            args.previous_close
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                .insert((header.exchange_segment_raw, header.security_id), event.clone());
+                                            if !has_receiver {
+                                                let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
+                                                    id: args.id,
+                                                    event: "previous-close-cached",
+                                                });
+                                            }
+                                        } else if !has_receiver {
+                                            let event_name = market_event_name(&event);
                                             let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
                                                 id: args.id,
-                                                event: "previous-close-cached",
+                                                event: event_name,
                                             });
+                                            reporter.gap(GapCause::NoReceiver { event: event_name });
                                         }
-                                    } else if !has_receiver {
-                                        let event_name = market_event_name(&event);
-                                        let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
-                                            id: args.id,
-                                            event: event_name,
-                                        });
-                                        reporter.gap(GapCause::NoReceiver { event: event_name });
-                                    }
-                                    let dhan_disconnect = match &event {
-                                        MarketFeedEvent::Disconnect { reason_code, .. } => Some(*reason_code),
-                                        _ => None,
-                                    };
-                                    detect_lag(
-                                        &args.parsed_tx,
-                                        args.parsed_capacity,
-                                        args.id,
-                                        &args.lifecycle_tx,
-                                        reporter,
-                                    );
-                                    let _ = args.parsed_tx.send(event);
-                                    if let Some(reason_code) = dhan_disconnect {
-                                        let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::DhanDisconnected {
-                                            id: args.id,
-                                            reason_code,
-                                        });
-                                        let error = format!("Dhan disconnected feed with reason {reason_code}");
-                                        reporter.error(error.clone());
-                                        record_transport_loss(reporter, *ever_live, None, error);
-                                        return match reason_code {
-                                            807..=809 => ConnectedOutcome::WaitForCredential(connection_credential_version),
-                                            804 | 806 | 810..=814 => ConnectedOutcome::Blocked,
-                                            _ => ConnectedOutcome::Retry,
+                                        let dhan_disconnect = match &event {
+                                            MarketFeedEvent::Disconnect { reason_code, .. } => Some(*reason_code),
+                                            _ => None,
                                         };
+                                        detect_lag(
+                                            &args.parsed_tx,
+                                            args.parsed_capacity,
+                                            args.id,
+                                            &args.lifecycle_tx,
+                                            reporter,
+                                        );
+                                        let _ = args.parsed_tx.send(event);
+                                        if let Some(reason_code) = dhan_disconnect {
+                                            let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::DhanDisconnected {
+                                                id: args.id,
+                                                reason_code,
+                                            });
+                                            let error = format!("Dhan disconnected feed with reason {reason_code}");
+                                            reporter.error(error.clone());
+                                            record_transport_loss(reporter, *ever_live, None, error);
+                                            return match reason_code {
+                                                807..=809 => ConnectedOutcome::WaitForCredential(connection_credential_version),
+                                                804 | 806 | 810..=814 => ConnectedOutcome::Blocked,
+                                                _ => ConnectedOutcome::Retry,
+                                            };
+                                        }
+                                        *ever_live = true;
+                                        reporter.valid_data();
                                     }
-                                    *ever_live = true;
-                                    reporter.valid_data();
                                 }
                                 Err(error) => {
                                     let error = error.to_string();

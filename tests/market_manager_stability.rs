@@ -543,6 +543,73 @@ async fn live_data_without_a_receiver_latches_an_explicit_gap() {
 }
 
 #[tokio::test]
+async fn coalesced_binary_message_delivers_every_packet_without_a_gap() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (event_tx, _) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_with_query(stream, 1, event_tx)
+            .await
+            .expect("local WebSocket upgrade");
+        while let Some(message) = socket.next().await {
+            match message.unwrap() {
+                Message::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["RequestCode"] == 15 {
+                        let message =
+                            [ticker_packet(1), ticker_packet(2), ticker_packet(3)].concat();
+                        socket.send(Message::Binary(message.into())).await.unwrap();
+                    }
+                }
+                Message::Close(_) => {
+                    let _ = socket.close(None).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut manager = DhanFeedManagerBuilder::new("client", "token")
+        .max_connections(1)
+        .market_feed_url(endpoint)
+        .build();
+    manager.start().await.unwrap();
+    let mut parsed = manager.get_parsed_channel(ConnectionId(0)).unwrap();
+    manager
+        .subscribe(
+            &[Instrument::new("NSE_EQ", "101")],
+            FeedRequestCode::SubscribeTicker,
+        )
+        .await
+        .unwrap();
+
+    let sequences = timeout(Duration::from_secs(2), async {
+        let mut sequences = Vec::new();
+        while sequences.len() < 3 {
+            if let MarketFeedEvent::Ticker { ltt, .. } = parsed.recv().await.unwrap() {
+                sequences.push(ltt);
+            }
+        }
+        sequences
+    })
+    .await
+    .expect("coalesced packets were not all delivered");
+    assert_eq!(sequences, [1, 2, 3]);
+
+    let health = manager.health();
+    let connection = &health.connections[0];
+    assert_eq!(connection.data_quality, MarketDataQuality::Current);
+    assert_eq!(connection.parser_error_count, 0);
+    assert_eq!(connection.gap_count, 0);
+    assert!(connection.gap_cause.is_none());
+
+    manager.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn pre_live_parse_failure_is_readiness_failure_not_tick_gap() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());

@@ -31,7 +31,7 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -249,6 +249,10 @@ pub struct DepthLevel {
 
 const MAX_INSTRUMENTS_PER_REQUEST: usize = 100;
 const MAX_UNIQUE_INSTRUMENTS: usize = 5_000;
+// One subscribed instrument may produce a primary packet, Previous Close, and
+// OI. Bound a single coalesced WebSocket message to that provider-domain
+// maximum plus room for control/status packets.
+pub(crate) const MAX_PACKETS_PER_MESSAGE: usize = MAX_UNIQUE_INSTRUMENTS * 3 + 16;
 const DISCONNECT_WAIT: Duration = Duration::from_secs(2);
 
 fn invalid_packet(message: impl Into<String>) -> DhanError {
@@ -357,13 +361,15 @@ pub fn parse_header(data: &[u8]) -> Result<PacketHeader> {
     })
 }
 
-/// Parse a complete binary packet into a [`MarketFeedEvent`].
+/// Parse one complete binary packet into a [`MarketFeedEvent`].
 ///
-/// The input `data` should be a full binary WebSocket message as received
-/// from DhanHQ, starting with the 8-byte packet header.
+/// The input `data` must contain exactly one packet, starting with its 8-byte
+/// header. A WebSocket binary message can contain multiple such packets; use
+/// [`parse_packets`] for raw messages received from DhanHQ.
 ///
 /// This is also useful for parsing raw frames obtained from
-/// [`DhanFeedManager::get_raw_channel`](super::manager::DhanFeedManager::get_raw_channel).
+/// [`DhanFeedManager::get_raw_channel`](super::manager::DhanFeedManager::get_raw_channel)
+/// after splitting them into individual packets.
 pub fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
     let header = parse_header(data)?;
     if usize::from(header.message_length) != data.len() {
@@ -548,6 +554,48 @@ pub fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
     }
 }
 
+/// Parse every Dhan packet coalesced into one WebSocket binary message.
+///
+/// Dhan may concatenate multiple complete packets in a single binary message.
+/// Each packet retains its own 8-byte header and declared length. Parsing is
+/// all-or-nothing: no event is returned unless the complete message is a
+/// bounded sequence of individually valid packets.
+pub fn parse_packets(data: &[u8]) -> Result<Vec<MarketFeedEvent>> {
+    if data.is_empty() {
+        return Err(invalid_packet("empty market-feed binary message"));
+    }
+
+    let mut remaining = data;
+    let mut events = Vec::new();
+    while !remaining.is_empty() {
+        if events.len() >= MAX_PACKETS_PER_MESSAGE {
+            return Err(invalid_packet(format!(
+                "market-feed binary message exceeds {MAX_PACKETS_PER_MESSAGE} packets"
+            )));
+        }
+
+        let header = parse_header(remaining)?;
+        let packet_len = usize::from(header.message_length);
+        if packet_len < 8 {
+            return Err(invalid_packet(format!(
+                "declared packet length {packet_len} is shorter than the 8-byte header"
+            )));
+        }
+        if packet_len > remaining.len() {
+            return Err(invalid_packet(format!(
+                "declared packet length {packet_len} exceeds remaining WebSocket binary message length {}",
+                remaining.len()
+            )));
+        }
+
+        let (packet, rest) = remaining.split_at(packet_len);
+        events.push(parse_packet(packet)?);
+        remaining = rest;
+    }
+
+    Ok(events)
+}
+
 // ---------------------------------------------------------------------------
 // Stream wrapper
 // ---------------------------------------------------------------------------
@@ -565,6 +613,7 @@ pub struct MarketFeedStream {
     read: SplitStream<WsStream>,
     write: SplitSink<WsStream, Message>,
     subscriptions: HashMap<(String, String), u8>,
+    pending_events: VecDeque<MarketFeedEvent>,
 }
 
 impl MarketFeedStream {
@@ -591,6 +640,7 @@ impl MarketFeedStream {
             read,
             write,
             subscriptions: HashMap::new(),
+            pending_events: VecDeque::new(),
         })
     }
 
@@ -790,11 +840,17 @@ impl Stream for MarketFeedStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
+            }
             match self.read.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
                     match msg {
-                        Message::Binary(data) => match parse_packet(&data) {
-                            Ok(event) => return Poll::Ready(Some(Ok(event))),
+                        Message::Binary(data) => match parse_packets(&data) {
+                            Ok(events) => {
+                                self.pending_events.extend(events);
+                                continue;
+                            }
                             Err(e) => {
                                 tracing::warn!("Failed to parse market feed packet: {e}");
                                 return Poll::Ready(Some(Err(e)));
@@ -939,6 +995,49 @@ mod tests {
         }
         assert!(parse_packet(&packet(2, vec![0; 9])).is_err());
         assert!(parse_packet(&[2, 8, 0, 1, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn parses_multiple_packets_from_one_websocket_binary_message() {
+        let first = packet(2, [101.5_f32.to_le_bytes(), 11_i32.to_le_bytes()].concat());
+        let second = packet(5, 42_i32.to_le_bytes().to_vec());
+        let third = packet(6, [99.5_f32.to_le_bytes(), 7_i32.to_le_bytes()].concat());
+        let message = [first, second, third].concat();
+
+        let events = parse_packets(&message).expect("coalesced packets must parse");
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            MarketFeedEvent::Ticker { ltp, ltt, .. } if ltp == 101.5 && ltt == 11
+        ));
+        assert!(matches!(events[1], MarketFeedEvent::OI { oi: 42, .. }));
+        assert!(matches!(
+            events[2],
+            MarketFeedEvent::PrevClose { prev_close, prev_oi: 7, .. }
+                if prev_close == 99.5
+        ));
+    }
+
+    #[test]
+    fn coalesced_packet_parsing_is_bounded_and_all_or_nothing() {
+        assert!(parse_packets(&[]).is_err());
+
+        let valid = packet(2, [101.5_f32.to_le_bytes(), 11_i32.to_le_bytes()].concat());
+        let mut truncated_tail = valid.clone();
+        truncated_tail.extend_from_slice(&[5, 12, 0, 1]);
+        assert!(parse_packets(&truncated_tail).is_err());
+
+        let mut short_declared = valid.clone();
+        short_declared.extend_from_slice(&[2, 7, 0, 1, 0, 0, 0, 0]);
+        assert!(parse_packets(&short_declared).is_err());
+
+        let too_many = std::iter::repeat_n(
+            packet(5, 0_i32.to_le_bytes().to_vec()),
+            MAX_PACKETS_PER_MESSAGE + 1,
+        )
+        .flatten()
+        .collect::<Vec<_>>();
+        assert!(parse_packets(&too_many).is_err());
     }
 
     #[test]
