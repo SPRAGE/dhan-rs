@@ -39,6 +39,7 @@
 //! - Up to 5,000 instruments per connection
 //! - Up to 100 instruments per subscribe/unsubscribe message
 
+pub mod delivery;
 pub mod depth;
 pub mod manager;
 pub mod market_feed;

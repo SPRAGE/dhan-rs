@@ -21,7 +21,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
+      - run: cargo check --locked --all-targets --all-features
 
   fmt:
     name: Rustfmt
@@ -44,7 +44,7 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -55,7 +55,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo test --locked --doc --all-features
 
   doc:
     name: Documentation
@@ -66,7 +67,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -Dwarnings
 
@@ -80,5 +81,5 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo package --list
-      - run: cargo package
+      - run: cargo package --locked --list
+      - run: cargo package --locked

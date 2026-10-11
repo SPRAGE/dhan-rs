@@ -708,3 +708,95 @@ mod tests {
         assert!(invalid.validate().is_err());
     }
 }
+
+string_wire_enum!(NewsCategory {
+    All => "ALL", Companies => "COMPANIES", EquityMarkets => "EQUITY_MARKETS",
+    DebtMarkets => "DEBT_MARKETS", Ipo => "IPO", Global => "GLOBAL",
+    IndianEconomy => "INDIAN_ECONOMY", GlobalEconomy => "GLOBAL_ECONOMY",
+    Currency => "CURRENCY", Commodities => "COMMODITIES", Cryptocurrencies => "CRYPTOCURRENCIES",
+    GovernmentPolicyAndRegulation => "GOVERNMENT_POLICY_AND_REGULATION",
+    Infrastructure => "INFRASTRUCTURE", InternationalTrade => "INTERNATIONAL_TRADE",
+    InvestmentIdeas => "INVESTMENT_IDEAS", RealEstate => "REAL_ESTATE", Startups => "STARTUPS",
+    Technology => "TECHNOLOGY", MutualFunds => "MUTUAL_FUNDS",
+});
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NewsUniverse {
+    Portfolio,
+    Watchlist,
+}
+
+/// Latest headline filters from Dhan's current OpenAPI specification.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewsHeadlineRequest {
+    pub dhan_client_id: String,
+    pub categories: Vec<NewsCategory>,
+    pub limit: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub universe: Option<NewsUniverse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stock_list: Option<Vec<String>>,
+}
+
+impl NewsHeadlineRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.dhan_client_id.trim().is_empty() {
+            return Err("dhanClientId must not be empty");
+        }
+        if self.categories.is_empty()
+            || self.categories.iter().any(|c| c.as_str().trim().is_empty())
+        {
+            return Err("categories must be a nonempty array of category identifiers");
+        }
+        if !(1..=50).contains(&self.limit) {
+            return Err("news limit must be between 1 and 50");
+        }
+        if self
+            .stock_list
+            .as_ref()
+            .is_some_and(|ids| ids.iter().any(|id| id.trim().is_empty()))
+        {
+            return Err("stockList must not contain empty security IDs");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewsHeadlineResponse {
+    pub data: NewsData,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewsData {
+    #[serde(default)]
+    pub latest_news: Vec<NewsHeadlineDetail>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewsHeadlineDetail {
+    pub news_object: Option<NewsObject>,
+    pub category: Option<String>,
+    pub sub_category: Option<String>,
+    pub publish_date: Option<String>,
+    pub stock_name: Option<String>,
+    pub isin_code: Option<String>,
+    pub sm_symbol: Option<String>,
+    pub nse_scrip_code: Option<u64>,
+    pub bse_scrip_code: Option<u64>,
+    pub display_symbol: Option<String>,
+    pub tick_size: Option<f64>,
+    pub lot_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewsObject {
+    pub overall_sentiment: Option<String>,
+    pub title: Option<String>,
+    pub text: Option<String>,
+}

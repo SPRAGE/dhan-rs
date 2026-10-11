@@ -315,8 +315,14 @@ async fn cancel_and_verify(
         .call("DELETE /orders/{order-id}", client.cancel_order(order_id))
         .await
     {
-        Ok(response) if is_safe_terminal_status(&response.order_status) => return Ok(()),
-        Ok(response) if is_trade_status(&response.order_status) => {
+        Ok(dhan_rs::types::orders::CancellationOutcome::Reported(response))
+            if is_safe_terminal_status(&response.order_status) =>
+        {
+            return Ok(());
+        }
+        Ok(dhan_rs::types::orders::CancellationOutcome::Reported(response))
+            if is_trade_status(&response.order_status) =>
+        {
             return Err(ProbeFailure::SafetyIncident(
                 "safety incident: sandbox order traded during cleanup",
             ));

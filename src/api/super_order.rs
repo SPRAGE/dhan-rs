@@ -2,7 +2,7 @@
 
 use crate::client::{DhanClient, required_path_segment};
 use crate::error::{DhanError, Result};
-use crate::types::orders::OrderResponse;
+use crate::types::orders::{CancellationOutcome, OrderResponse};
 use crate::types::super_order::*;
 
 impl DhanClient {
@@ -30,10 +30,14 @@ impl DhanClient {
     /// Cancelling the `ENTRY_LEG` cancels all legs.
     ///
     /// **Endpoint:** `DELETE /v2/super/orders/{order-id}/{order-leg}`
-    pub async fn cancel_super_order(&self, order_id: &str, leg: &str) -> Result<OrderResponse> {
-        let order_id = required_path_segment("order_id", order_id)?;
+    pub async fn cancel_super_order(
+        &self,
+        order_id: &str,
+        leg: &str,
+    ) -> Result<CancellationOutcome> {
+        let path_id = required_path_segment("order_id", order_id)?;
         validate_super_order_leg(leg)?;
-        self.delete(&format!("/v2/super/orders/{order_id}/{leg}"))
+        self.delete_cancellation(&format!("/v2/super/orders/{path_id}/{leg}"), order_id)
             .await
     }
 
@@ -42,8 +46,8 @@ impl DhanClient {
     ///
     /// Dhan's linked OpenAPI describes a `200` JSON [`OrderResponse`] for this
     /// operation, while the HTML page describes `202 Accepted` with no body.
-    /// [`Self::cancel_super_order`] models the OpenAPI form; this method models
-    /// the HTML form without attempting to deserialize an empty response.
+    /// [`Self::cancel_super_order`] handles both forms explicitly. This helper
+    /// retains the legacy interface for callers that only need HTTP acceptance.
     ///
     /// **Endpoint:** `DELETE /v2/super/orders/{order-id}/{order-leg}`
     pub async fn cancel_super_order_no_content(&self, order_id: &str, leg: &str) -> Result<()> {

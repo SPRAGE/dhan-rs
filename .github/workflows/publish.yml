@@ -8,12 +8,22 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
+  ci:
+    name: Release checks
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Publish
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,19 +35,74 @@ jobs:
 
       # Verify the tag version matches Cargo.toml version
       - name: Verify version
+        id: version
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          CARGO_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "ERROR: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
           echo "Version verified: $TAG_VERSION"
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package release
+        run: cargo package --locked
+
+      # A lost upload response may still leave an immutable registry version.
+      # Resume only when it is byte-identical to this commit's package.
+      - name: Check published artifact
+        id: registry
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          version = os.environ["RELEASE_VERSION"]
+          package = Path(f"target/package/dhan-rs-{version}.crate")
+          checksum = hashlib.sha256(package.read_bytes()).hexdigest()
+          request = urllib.request.Request(
+              "https://crates.io/api/v1/crates/dhan-rs/" + urllib.parse.quote(version, safe=""),
+              headers={"User-Agent": "dhan-rs-release-workflow (github.com/SPRAGE/dhan-rs)"},
+          )
+          published = False
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  record = json.load(response)["version"]
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          else:
+              if (record["crate"] != "dhan-rs" or record["num"] != version
+                      or record["yanked"] or record["checksum"] != checksum):
+                  raise SystemExit("Registry version exists but differs from the intended artifact")
+              published = True
+              print("The identical release artifact is already published; resuming")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"published={str(published).lower()}\n")
+          PY
 
       - name: Publish to crates.io
-        run: cargo publish
+        if: steps.registry.outputs.published != 'true'
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    name: GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -48,9 +113,11 @@ jobs:
 
             ```toml
             [dependencies]
-            dhan-rs = "${{ github.ref_name }}"
+            dhan-rs = "${{ needs.publish.outputs.version }}"
             ```
 
             See [crates.io](https://crates.io/crates/dhan-rs) and [docs.rs](https://docs.rs/dhan-rs) for details.
 
-            > ⚠️ **This crate is AI-generated and has not been extensively tested. See [DISCLAIMER.md](DISCLAIMER.md).**
+            See the [changelog](https://github.com/SPRAGE/dhan-rs/blob/${{ github.ref_name }}/CHANGELOG.md) for changes and migration notes.
+
+            > ⚠️ **This crate is AI-generated and has not been extensively tested. See [DISCLAIMER.md](https://github.com/SPRAGE/dhan-rs/blob/${{ github.ref_name }}/DISCLAIMER.md).**

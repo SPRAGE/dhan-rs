@@ -194,3 +194,58 @@ async fn data_validation_rejects_invalid_cross_field_combinations_before_io() {
     };
     assert!(client.get_market_movers(&missing_expiry).await.is_err());
 }
+
+#[tokio::test]
+async fn news_headlines_match_current_openapi_and_omit_optional_filters() {
+    use dhan_rs::types::data::{NewsCategory, NewsHeadlineRequest};
+    let body = r#"{"data":{"latestNews":[{"newsObject":{"title":"Example","overallSentiment":"neutral"},"category":"companies","nseScripCode":1333}]}}"#;
+    let (url, requests) = serve_sequence(vec![response("application/json", body)]).await;
+    let client = DhanClient::with_base_url("client", "token", url);
+    let request = NewsHeadlineRequest {
+        dhan_client_id: "client".into(),
+        categories: vec![NewsCategory::All],
+        limit: 50,
+        universe: None,
+        stock_list: None,
+    };
+    let result = client.get_news_headlines(&request).await.unwrap();
+    assert_eq!(
+        result.data.latest_news[0]
+            .news_object
+            .as_ref()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Example")
+    );
+    let requests = requests.await.unwrap();
+    let (line, _, body) = split_request(&requests[0]);
+    assert_eq!(line, "POST /v2/data/newsheadline HTTP/1.1");
+    assert_eq!(
+        body,
+        json!({"dhanClientId":"client","categories":["ALL"],"limit":50})
+    );
+}
+
+#[test]
+fn news_filters_reject_documented_limit_and_category_violations() {
+    use dhan_rs::types::data::{NewsCategory, NewsHeadlineRequest, NewsUniverse};
+    let mut request = NewsHeadlineRequest {
+        dhan_client_id: "client".into(),
+        categories: vec![NewsCategory::Companies],
+        limit: 1,
+        universe: Some(NewsUniverse::Portfolio),
+        stock_list: Some(vec!["1333".into()]),
+    };
+    assert!(request.validate().is_ok());
+    let body = serde_json::to_value(&request).unwrap();
+    assert_eq!(body["universe"], "PORTFOLIO");
+    assert_eq!(body["stockList"], json!(["1333"]));
+    request.limit = 0;
+    assert!(request.validate().is_err());
+    request.limit = 51;
+    assert!(request.validate().is_err());
+    request.limit = 50;
+    request.categories.clear();
+    assert!(request.validate().is_err());
+}

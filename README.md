@@ -74,13 +74,23 @@ boundaries that still require authenticated validation.
 | **WebSocket: Managed Market Feed** | Lazy multi-socket ownership, retry, health, gap acknowledgement, and graceful shutdown |
 | **WebSocket: Order Updates** | Real-time order status changes (JSON protocol), plus an optional managed/reconciling supervisor |
 | **Full Market Depth** | Separate caller-polled 20-level and 200-level protocols; no depth reconnect manager yet |
-| **Data APIs** | Rolling expired options, technical metrics, market movers, and company information |
+| **Data APIs** | Rolling expired options, technical metrics, market movers, company information, and news headlines |
 | **Global Stocks** | Orders, estimates, margin, trades, market status, holdings, and fund limits |
 | **Instruments** | Compact/detailed public CSV and authenticated segment CSV downloads |
 
-For the managed market feed, create parsed receivers before subscribing.
-Otherwise a live packet with no receiver is intentionally reported as a
-durable data-quality gap rather than discarded silently.
+For the managed market feed, create the selected event or batch receiver before
+subscribing. A price packet without its authoritative consumer produces a
+durable data-quality gap. Previous Close is cached for the current receipt
+session and desired instrument set.
+
+The manager defaults to individual events. For one consumer processing complete
+messages, select `MarketFeedDelivery::Batches`; this avoids per-packet broadcasts
+and allocates no parsed event ring. Raw frames are optional observers and use
+shared byte buffers. See [delivery and compatibility](docs/implementation-status.md#batch-delivery-and-compatibility).
+
+`cancel_order` and `cancel_super_order` return `CancellationOutcome`: empty
+202/204 responses are `Accepted`, while JSON results are `Reported(OrderResponse)`.
+Acceptance alone does not establish a final cancelled state.
 
 ## Installation
 
@@ -88,7 +98,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dhan-rs = "0.1"
+dhan-rs = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 

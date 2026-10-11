@@ -283,6 +283,46 @@ impl DhanClient {
         self.handle_response(resp).await
     }
 
+    /// Handle the two documented cancellation response contracts explicitly.
+    pub(crate) async fn delete_cancellation(
+        &self,
+        path: &str,
+        order_id: &str,
+    ) -> Result<crate::types::orders::CancellationOutcome> {
+        use crate::types::orders::{CancellationOutcome, OrderResponse};
+        let response = self
+            .http
+            .delete(self.url(path))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|source| DhanError::ResponseBody { status, source })?;
+        if !status.is_success() {
+            return Err(self.parse_error_body(status, &String::from_utf8_lossy(&bytes)));
+        }
+        if bytes.is_empty()
+            && matches!(
+                status,
+                reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT
+            )
+        {
+            return Ok(CancellationOutcome::Accepted {
+                order_id: order_id.to_owned(),
+            });
+        }
+        let response: OrderResponse = serde_json::from_slice(&bytes)?;
+        if response.order_id != order_id {
+            return Err(DhanError::InvalidArgument(
+                "cancellation response order ID does not match request".into(),
+            ));
+        }
+        Ok(CancellationOutcome::Reported(response))
+    }
+
     /// Perform a DELETE request that returns no body (expects 202 Accepted).
     pub async fn delete_no_content(&self, path: &str) -> Result<()> {
         let url = self.url(path);

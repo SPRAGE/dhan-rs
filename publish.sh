@@ -56,8 +56,8 @@ info "Running pre-flight checks..."
 BRANCH=$(git branch --show-current)
 [[ "$BRANCH" == "main" ]] || die "Must be on 'main' branch (currently on '$BRANCH')."
 
-# Working tree must be clean (unless we're about to bump version)
-if [[ -z "$NEW_VERSION" ]] && ! git diff --quiet HEAD 2>/dev/null; then
+# A version argument must not bypass review of tracked or untracked changes.
+if [[ -n "$(git status --porcelain)" ]]; then
     die "Working tree has uncommitted changes. Commit or stash them first."
 fi
 
@@ -83,6 +83,7 @@ if [[ -n "$NEW_VERSION" ]]; then
     if [[ "$NEW_VERSION" == "$CURRENT_VERSION" ]]; then
         warn "Version is already $NEW_VERSION, skipping bump."
     else
+        $DRY_RUN && die "Dry runs do not bump versions. Prepare $NEW_VERSION first, or omit VERSION."
         info "Bumping version: ${CURRENT_VERSION} → ${NEW_VERSION}"
         sed -i "s/^version = \"${CURRENT_VERSION}\"/version = \"${NEW_VERSION}\"/" Cargo.toml
 
@@ -104,10 +105,15 @@ else
 fi
 
 TAG="v${VERSION}"
+RELEASE_COMMIT=$(git rev-parse HEAD)
+TAG_EXISTS=false
 
-# Check tag doesn't already exist
-if git tag -l "$TAG" | grep -q "$TAG"; then
-    die "Git tag '$TAG' already exists. Bump the version or delete the tag."
+# A failed push may leave a valid local tag. Never replace a different tag.
+if git show-ref --verify --quiet "refs/tags/$TAG"; then
+    [[ "$(git rev-parse "${TAG}^{commit}")" == "$RELEASE_COMMIT" ]] ||
+        die "Git tag '$TAG' points at a different commit. Review the release state."
+    TAG_EXISTS=true
+    warn "Reusing local tag $TAG at the validated commit."
 fi
 
 # ---------------------------------------------------------------------------
@@ -115,23 +121,24 @@ fi
 # ---------------------------------------------------------------------------
 
 info "Running cargo check..."
-cargo check --all-targets --quiet
+cargo check --locked --all-targets --all-features --quiet
 ok "cargo check passed"
 
 info "Running cargo fmt check..."
-cargo fmt --all -- --check 2>/dev/null || die "cargo fmt found issues. Run 'cargo fmt' first."
+cargo fmt --all -- --check || die "cargo fmt found issues. Run 'cargo fmt' first."
 ok "cargo fmt passed"
 
 info "Running clippy..."
-cargo clippy --all-targets --quiet -- -D warnings 2>/dev/null || die "clippy found warnings."
+cargo clippy --locked --all-targets --all-features --quiet -- -D warnings || die "clippy found warnings."
 ok "clippy passed"
 
 info "Running tests..."
-cargo test --quiet 2>/dev/null
+cargo test --locked --all-targets --all-features --quiet
+cargo test --locked --doc --all-features --quiet
 ok "Tests passed"
 
 info "Building documentation..."
-RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --quiet 2>/dev/null
+RUSTDOCFLAGS="-Dwarnings" cargo doc --locked --no-deps --all-features --quiet
 ok "Documentation builds cleanly"
 
 # ---------------------------------------------------------------------------
@@ -139,10 +146,10 @@ ok "Documentation builds cleanly"
 # ---------------------------------------------------------------------------
 
 info "Verifying crate package..."
-cargo package --allow-dirty --quiet 2>/dev/null
+cargo package --locked --quiet
 ok "Package verified (${VERSION})"
 
-PACKAGE_SIZE=$(du -h "target/package/dhan-rs-${VERSION}.crate" 2>/dev/null | cut -f1)
+PACKAGE_SIZE=$(du -h "${CARGO_TARGET_DIR:-target}/package/dhan-rs-${VERSION}.crate" 2>/dev/null | cut -f1)
 info "Package size: ${PACKAGE_SIZE:-unknown}"
 
 # ---------------------------------------------------------------------------
@@ -152,7 +159,7 @@ info "Package size: ${PACKAGE_SIZE:-unknown}"
 if $DRY_RUN; then
     echo ""
     warn "Dry run — skipping tag creation and publish."
-    info "Would create tag: ${TAG}"
+    info "Would publish tag: ${TAG} at ${RELEASE_COMMIT}"
     info "Would publish: dhan-rs ${VERSION}"
     echo ""
     info "To publish for real, run:"
@@ -160,36 +167,37 @@ if $DRY_RUN; then
     exit 0
 fi
 
+[[ -z "$(git status --porcelain)" ]] || die "Checks changed the working tree. Review and commit before releasing."
+[[ "$(git rev-parse HEAD)" == "$RELEASE_COMMIT" ]] || die "HEAD changed during checks. Restart the release."
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Ready to release ${CYAN}dhan-rs v${VERSION}${NC}"
 echo ""
 echo "  This will:"
-echo "    1. Create git tag ${CYAN}${TAG}${NC}"
-echo "    2. Push tag to origin"
-echo "    3. GitHub Actions will publish to ${CYAN}crates.io${NC}"
+echo "    1. Create or reuse git tag ${CYAN}${TAG}${NC}"
+echo "    2. Atomically push main and the tag to origin"
+echo "    3. GitHub Actions will validate and publish to ${CYAN}crates.io${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 printf "Continue? [y/N] "
 read -r CONFIRM
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
 
-# Create and push tag
-info "Creating tag ${TAG}..."
-git tag -a "$TAG" -m "Release ${VERSION}"
-ok "Tag created: ${TAG}"
+# Both remote refs succeed together; a retry can reuse the exact local tag.
+if ! $TAG_EXISTS; then
+    info "Creating tag ${TAG}..."
+    git tag -a "$TAG" "$RELEASE_COMMIT" -m "Release ${VERSION}"
+    ok "Tag created: ${TAG}"
+fi
 
-info "Pushing commits to origin..."
-git push origin main --quiet 2>/dev/null
-ok "Commits pushed"
-
-info "Pushing tag to origin..."
-git push origin "$TAG" --quiet 2>/dev/null
-ok "Tag ${TAG} pushed — GitHub Actions will publish to crates.io"
+info "Publishing main and ${TAG} atomically..."
+git push --atomic origin "${RELEASE_COMMIT}:refs/heads/main" "refs/tags/${TAG}:refs/tags/${TAG}"
+ok "Release refs synchronized — check GitHub Actions for publication"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ${GREEN}✔ dhan-rs v${VERSION} release triggered!${NC}"
+echo "  ${GREEN}✔ dhan-rs v${VERSION} release refs synchronized!${NC}"
 echo ""
 echo "  🚀 GitHub Actions will run CI and publish automatically."
 echo "  🔗 https://github.com/SPRAGE/dhan-rs/actions"

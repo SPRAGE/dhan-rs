@@ -50,4 +50,14 @@ impl DhanClient {
             .map_err(|message| DhanError::InvalidArgument(message.into()))?;
         self.post("/v2/data/companyinfo", req).await
     }
+    /// Fetch latest news headlines, filtered by category, stock, or universe.
+    /// **Endpoint:** `POST /v2/data/newsheadline`
+    pub async fn get_news_headlines(
+        &self,
+        req: &NewsHeadlineRequest,
+    ) -> Result<NewsHeadlineResponse> {
+        req.validate()
+            .map_err(|message| DhanError::InvalidArgument(message.into()))?;
+        self.post("/v2/data/newsheadline", req).await
+    }
 }

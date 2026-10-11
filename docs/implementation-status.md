@@ -1,6 +1,6 @@
 # Implementation status and operating boundaries
 
-> Status: implementation snapshot, 2026-08-11. This is an unofficial client,
+> Status: implementation snapshot, 2026-10-11. This is an unofficial client,
 > not a certification for live trading. The documented behaviors below have
 > deterministic local coverage, but have not been verified with authenticated
 > Dhan services.
@@ -24,7 +24,7 @@ The latest additions and corrections are:
 
 | Area | Typed API or behavior |
 |---|---|
-| Data APIs | `get_rolling_option_data`, `get_technical_metrics`, `get_market_movers`, and `get_company_info` |
+| Data APIs | `get_rolling_option_data`, `get_technical_metrics`, `get_market_movers`, `get_company_info`, and `get_news_headlines` |
 | Instrument masters | `download_compact_instruments_csv`, `download_detailed_instruments_csv`, and `download_segment_instruments_csv` |
 | Global Stocks | Orders, estimates, margin, trades, market status, holdings, and fund-limit methods in `api::global_stocks` |
 | Conditional/eDIS | `place_multi_order` and `generate_bulk_edis_form` |
@@ -48,9 +48,11 @@ places:
   `/v2/forever/orders`; `get_all_forever_orders` and
   `get_all_forever_orders_openapi` expose the alternatives explicitly;
 - consent-flow examples and prose disagree about three request verbs;
-- Super Order cancellation is described with incompatible success envelopes;
-  `cancel_super_order` models the OpenAPI JSON response and
-  `cancel_super_order_no_content` models the HTML empty response;
+- ordinary and Super Order cancellation have incompatible success envelopes;
+  both typed methods accept empty 202/204 responses and JSON status results as
+  distinct `CancellationOutcome` variants;
+- trades by order ID are documented as an object in HTML and an array in OpenAPI;
+  `get_trades_for_order` accepts either and checks every returned order ID;
 - multi-margin request/response shapes differ between sources; and
 - Full Market Depth disconnect framing is internally inconsistent.
 
@@ -121,18 +123,85 @@ latest generation after each reconnect. It uses bounded connect/write/no-frame
 and first-valid-data readiness deadlines, bounded close handling, capped
 exponential full-jitter retries, token-version
 watching through `update_access_token`, and a stable-traffic period before the
-retry counter resets. It exposes parsed and optional raw broadcast channels,
-lifecycle diagnostics, a `watch` health snapshot, and a previous-close cache.
+retry counter resets. It exposes managed parsed receivers or single-consumer
+validated batches, optional raw observers, lifecycle diagnostics, a `watch`
+health snapshot, and a compact previous-close cache. Desired maps are shared
+across commands and reconciliation; only affected maps are copied during a
+subscription change, and a persistent instrument-location index avoids global
+index rebuilding.
 
 Transport recovery does not make missed prices reappear. A parse failure,
 receiver lag, or uncertain disconnect latches health at `GapDetected` with a
-typed cause. Receiving a live packet without any parsed receiver also latches
+typed cause. Receiving a live packet without the selected authoritative receiver also latches
 an explicit `NoReceiver` gap (Previous Close is cached separately). The latch
 survives reconnection. Reconcile the desired state from
 an authoritative snapshot after the replacement transport is data-live, then
 call `acknowledge_gap`; it will not clear the condition before that point.
 `shutdown` stops new retries, sends standard-feed RequestCode 12, attempts the
 close handshake, joins the task, and uses abort only as a bounded fallback.
+
+### Batch delivery and compatibility
+
+```rust,no_run
+use dhan_rs::ws::manager::{ConnectionId, DhanFeedManagerBuilder, MarketFeedDelivery};
+use dhan_rs::ws::market_feed::Instrument;
+use dhan_rs::types::enums::FeedRequestCode;
+
+# async fn example() -> dhan_rs::Result<()> {
+let mut manager = DhanFeedManagerBuilder::new("client", "token")
+    .max_connections(1)
+    .delivery(MarketFeedDelivery::Batches)
+    .batch_channel_capacity(256)
+    .batch_byte_capacity(8 * 1024 * 1024)
+    .build();
+manager.start().await?;
+let mut batches = manager.get_batch_channel(ConnectionId(0)).expect("one consumer");
+manager.subscribe(&[Instrument::new("NSE_EQ", "1333")], FeedRequestCode::SubscribeTicker).await?;
+if let Ok(mut batch) = batches.recv().await {
+    // Select one application runtime for the entire drain, preserving order.
+    for event in batch.drain_events() { let _ = event; }
+}
+manager.shutdown().await?;
+# Ok(())
+# }
+```
+
+A batch contains only a fully validated message. A malformed trailing packet
+rejects the whole message. The parser reads each packet header once, offers
+`parse_packets_into` for allocation reuse, and rejects messages above 8 MiB or
+15,016 packets. Health is published once after a healthy binary message;
+lifecycle events and gaps retain immediate notifications.
+
+The batch queue bounds both message count and decoded event/payload bytes,
+including batches held by the consumer. It never waits for delivery space:
+full queues or exhausted byte reservations drop the complete incoming batch,
+report its exact packet count, and latch a durable gap. The receiver returns
+`RecvError::Lagged(count)` and can continue reading retained batches. Dropping a
+batch releases its reservation and recycles at most one spare vector per
+connection. The byte budget is not a process RSS limit: the incoming message,
+parser scratch vector, spare vector, channel bookkeeping and socket buffers
+also consume bounded memory.
+
+Event receivers now return `ManagedMarketFeedReceiver<MarketFeedEvent>` rather
+than a bare Tokio receiver; `recv`, `try_recv`, and `resubscribe` preserve their
+familiar semantics. Actual Tokio overflow is reported when a receiver observes
+`Lagged`; requested capacity and queue-length predictions are never used as
+proof of packet loss. Raw receivers are diagnostic observers and their lag
+does not degrade the selected output. Parsed rings are allocated lazily in
+Events mode and are absent in Batches mode. Each batch receiver can be taken
+only once per manager slot; configure the delivery mode before creating the
+manager and attach the consumer before subscribing.
+
+Previous-close records include local receipt time and its IST receipt-session
+date. Records are restricted to desired instruments, pruned on unsubscribe,
+and expired at a session-date change. Receipt time is not a substitute for an
+exchange timestamp and reference packets must not refresh application price
+or depth liveness.
+
+Cancellation methods now return `CancellationOutcome::Accepted { order_id }`
+or `CancellationOutcome::Reported(OrderResponse)`. Migrate callers that assumed
+an unconditional `OrderResponse`, and continue reconciling accepted requests.
+The legacy Super Order no-content helper remains available.
 
 ### Managed order updates
 
@@ -198,7 +267,7 @@ behavior; order-update lifecycle, lag, reconciliation and shutdown; and
 
 The relevant integration suites are `rest_contracts`, `rest_path_hardening`,
 `data_instrument_contracts`, `global_stocks_contracts`,
-`remaining_contracts`, `market_manager_stability`, and
+`remaining_contracts`, `market_manager_stability`, `feed_delivery`, and
 `order_update_stability`. The tests use loopback servers and synthetic binary
 fixtures; they make no authenticated broker call and do not place, amend, or
 cancel live orders.

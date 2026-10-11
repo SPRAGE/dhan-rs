@@ -442,13 +442,24 @@ async fn caches_previous_close_before_receiver_and_surfaces_broadcast_lag() {
         MarketFeedEvent::PrevClose { prev_close, .. } if (*prev_close - 99.5).abs() < f32::EPSILON
     ));
 
-    let _slow_receiver = manager.get_parsed_channel(ConnectionId(0)).unwrap();
+    let mut slow_receiver = manager.get_parsed_channel(ConnectionId(0)).unwrap();
     release_tx.send(()).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while slow_receiver.len() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        slow_receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(2))
+    ));
     timeout(Duration::from_secs(2), async {
         loop {
             if matches!(
                 lifecycle.recv().await,
-                Ok(ManagerLifecycleEvent::ReceiverLag { dropped: 1, .. })
+                Ok(ManagerLifecycleEvent::ReceiverLag { dropped: 2, .. })
             ) {
                 break;
             }

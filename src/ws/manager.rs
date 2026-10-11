@@ -6,7 +6,8 @@
 //! commands, so no mutex is held across network I/O.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -17,13 +18,21 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 
+use super::delivery::{BatchSendError, BatchSender, ConsumerLag};
+pub use super::delivery::{
+    ManagedMarketFeedReceiver, MarketFeedBatch, MarketFeedBatchReceiver, MarketFeedDelivery,
+};
 use crate::constants::WS_MARKET_FEED_URL;
 use crate::error::{DhanError, Result};
 use crate::types::enums::FeedRequestCode;
-use crate::ws::market_feed::{Instrument, MAX_PACKETS_PER_MESSAGE, MarketFeedEvent, parse_packets};
+use crate::ws::market_feed::{
+    Instrument, MAX_MESSAGE_BYTES, MAX_PACKETS_PER_MESSAGE, MarketFeedEvent, PacketHeader,
+    parse_packets_into,
+};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 
 const DHAN_MAX_CONNECTIONS: u8 = 5;
 const DHAN_MAX_INSTRUMENTS: usize = 5_000;
@@ -250,6 +259,12 @@ pub struct DhanFeedConfig {
     pub parsed_channel_capacity: usize,
     pub raw_channel_capacity: usize,
     pub auto_reconnect: bool,
+    /// Select individual events or one validated batch per binary message.
+    pub delivery: MarketFeedDelivery,
+    /// Maximum queued batch count per connection.
+    pub batch_channel_capacity: usize,
+    /// Maximum bytes reserved by queued and consumer-held batches per connection.
+    pub batch_byte_capacity: usize,
 }
 
 impl Default for DhanFeedConfig {
@@ -262,6 +277,9 @@ impl Default for DhanFeedConfig {
             parsed_channel_capacity: MAX_PACKETS_PER_MESSAGE,
             raw_channel_capacity: 4_096,
             auto_reconnect: true,
+            delivery: MarketFeedDelivery::Events,
+            batch_channel_capacity: 64,
+            batch_byte_capacity: 8 * 1024 * 1024,
         }
     }
 }
@@ -314,6 +332,22 @@ impl DhanFeedManagerBuilder {
         self
     }
 
+    /// Choose the authoritative delivery path; raw frames remain observers.
+    pub fn delivery(mut self, delivery: MarketFeedDelivery) -> Self {
+        self.config.delivery = delivery;
+        self
+    }
+
+    pub fn batch_channel_capacity(mut self, cap: usize) -> Self {
+        self.config.batch_channel_capacity = cap;
+        self
+    }
+
+    pub fn batch_byte_capacity(mut self, bytes: usize) -> Self {
+        self.config.batch_byte_capacity = bytes;
+        self
+    }
+
     pub fn auto_reconnect(mut self, enable: bool) -> Self {
         self.config.auto_reconnect = enable;
         self
@@ -359,7 +393,7 @@ struct Credentials {
 enum SupervisorCommand {
     ReplaceDesired {
         generation: u64,
-        desired: DesiredSubscriptions,
+        desired: Arc<DesiredSubscriptions>,
         acknowledged: oneshot::Sender<()>,
     },
     AcknowledgeGap {
@@ -372,7 +406,11 @@ enum SupervisorCommand {
 
 struct ManagedConnection {
     id: ConnectionId,
-    parsed_tx: broadcast::Sender<MarketFeedEvent>,
+    parsed_tx: Option<Arc<OnceLock<broadcast::Sender<MarketFeedEvent>>>>,
+    batch_tx: Option<BatchSender>,
+    batch_rx: StdMutex<Option<MarketFeedBatchReceiver>>,
+    recycled_rx: Option<mpsc::Receiver<Vec<MarketFeedEvent>>>,
+    consumer_lag: Arc<ConsumerLag>,
     raw_tx: Option<broadcast::Sender<Bytes>>,
     lifecycle_tx: broadcast::Sender<ManagerLifecycleEvent>,
     health_rx: watch::Receiver<ConnectionHealth>,
@@ -380,9 +418,9 @@ struct ManagedConnection {
     command_tx: mpsc::Sender<SupervisorCommand>,
     command_rx: Option<mpsc::Receiver<SupervisorCommand>>,
     task: Option<JoinHandle<()>>,
-    instruments: DesiredSubscriptions,
+    instruments: Arc<DesiredSubscriptions>,
     desired_generation: u64,
-    previous_close: Arc<StdMutex<HashMap<(u8, u32), MarketFeedEvent>>>,
+    previous_close: Arc<StdMutex<HashMap<(u8, u32), PreviousCloseRecord>>>,
 }
 
 /// Multi-connection manager for the standard DhanHQ market feed.
@@ -393,6 +431,7 @@ pub struct DhanFeedManager {
     credentials_tx: watch::Sender<Credentials>,
     connections: Vec<ManagedConnection>,
     started: bool,
+    locations: HashMap<InstrumentKey, usize>,
 }
 
 impl DhanFeedManager {
@@ -430,13 +469,22 @@ impl DhanFeedManager {
             credentials_tx,
             connections,
             started: false,
+            locations: HashMap::new(),
         }
     }
 
     fn new_connection(id: ConnectionId, config: &DhanFeedConfig) -> ManagedConnection {
         // Use one here to keep the infallible constructor from panicking. start()
         // rejects the caller's zero capacity before any task or socket exists.
-        let (parsed_tx, _) = broadcast::channel(config.parsed_channel_capacity.max(1));
+        let parsed_tx =
+            (config.delivery == MarketFeedDelivery::Events).then(|| Arc::new(OnceLock::new()));
+        let (batch_tx, batch_rx, recycled_rx) = if config.delivery == MarketFeedDelivery::Batches {
+            let (tx, rx, recycled) =
+                BatchSender::channel(config.batch_channel_capacity, config.batch_byte_capacity);
+            (Some(tx), Some(rx), Some(recycled))
+        } else {
+            (None, None, None)
+        };
         let raw_tx = config.enable_raw_frames.then(|| {
             let (tx, _) = broadcast::channel(config.raw_channel_capacity.max(1));
             tx
@@ -447,6 +495,10 @@ impl DhanFeedManager {
         ManagedConnection {
             id,
             parsed_tx,
+            batch_tx,
+            batch_rx: StdMutex::new(batch_rx),
+            recycled_rx,
+            consumer_lag: Arc::new(ConsumerLag::default()),
             raw_tx,
             lifecycle_tx,
             health_rx,
@@ -454,7 +506,7 @@ impl DhanFeedManager {
             command_tx,
             command_rx: Some(command_rx),
             task: None,
-            instruments: HashMap::new(),
+            instruments: Arc::new(HashMap::new()),
             desired_generation: 0,
             previous_close: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -490,6 +542,11 @@ impl DhanFeedManager {
         if self.config.parsed_channel_capacity == 0 || self.config.raw_channel_capacity == 0 {
             return Err(DhanError::InvalidArgument(
                 "channel capacities must be nonzero".into(),
+            ));
+        }
+        if self.config.batch_channel_capacity == 0 || self.config.batch_byte_capacity == 0 {
+            return Err(DhanError::InvalidArgument(
+                "batch capacities must be nonzero".into(),
             ));
         }
         if self.config.reconnect_delay_ms == 0 {
@@ -563,49 +620,50 @@ impl DhanFeedManager {
             return Ok(());
         }
 
-        let old: Vec<_> = self
+        // Clone only the affected desired maps, once each. The manager's
+        // location index also covers repeated calls without rebuilding an
+        // index of the entire subscription universe.
+        let mut candidate: HashMap<usize, DesiredSubscriptions> = HashMap::new();
+        let mut loads: Vec<_> = self
             .connections
             .iter()
-            .map(|connection| connection.instruments.clone())
+            .map(|c| c.instruments.len())
             .collect();
-        let mut candidate = old.clone();
-        let mut loads: Vec<_> = candidate.iter().map(HashMap::len).collect();
-        let mut locations = HashMap::new();
-        for (index, desired) in candidate.iter().enumerate() {
-            for key in desired.keys() {
-                locations.insert(key.clone(), index);
-            }
-        }
-
+        let mut additions = HashMap::new();
         for instrument in instruments {
             let key = InstrumentKey::from(instrument);
-            if let Some(index) = locations.get(&key).copied() {
-                candidate[index].insert(key, (instrument.clone(), mode));
-                continue;
-            }
-            let index = loads
-                .iter()
-                .enumerate()
-                .filter(|(_, load)| **load < self.config.max_instruments_per_connection)
-                .min_by_key(|(_, load)| **load)
-                .map(|(index, _)| index)
-                .ok_or_else(|| {
-                    DhanError::InvalidArgument(format!(
-                        "all connections at capacity ({} instruments each)",
-                        self.config.max_instruments_per_connection
-                    ))
-                })?;
-            candidate[index].insert(key.clone(), (instrument.clone(), mode));
-            loads[index] += 1;
-            locations.insert(key, index);
+            let index = if let Some(index) = additions
+                .get(&key)
+                .or_else(|| self.locations.get(&key))
+                .copied()
+            {
+                index
+            } else {
+                let index = loads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, load)| **load < self.config.max_instruments_per_connection)
+                    .min_by_key(|(_, load)| **load)
+                    .map(|(index, _)| index)
+                    .ok_or_else(|| {
+                        DhanError::InvalidArgument(format!(
+                            "all connections at capacity ({} instruments each)",
+                            self.config.max_instruments_per_connection
+                        ))
+                    })?;
+                loads[index] += 1;
+                additions.insert(key.clone(), index);
+                index
+            };
+            candidate
+                .entry(index)
+                .or_insert_with(|| (*self.connections[index].instruments).clone())
+                .insert(key, (instrument.clone(), mode));
         }
-
-        self.commit_desired(candidate, old).await
+        self.commit_desired(candidate).await
     }
 
-    /// Remove instruments according to their tracked subscription mode.  The
-    /// supplied request code is validated as an unsubscribe operation, but the
-    /// wire code is derived from the manager's recorded mode.
+    /// Remove instruments using their tracked subscription mode.
     pub async fn unsubscribe(
         &mut self,
         instruments: &[Instrument],
@@ -614,57 +672,59 @@ impl DhanFeedManager {
         self.ensure_started()?;
         validate_unsubscribe_mode(mode)?;
         validate_instruments(instruments)?;
-        let old: Vec<_> = self
-            .connections
-            .iter()
-            .map(|connection| connection.instruments.clone())
-            .collect();
-        let mut candidate = old.clone();
+        let mut candidate: HashMap<usize, DesiredSubscriptions> = HashMap::new();
         for instrument in instruments {
             let key = InstrumentKey::from(instrument);
-            for desired in &mut candidate {
-                if desired.remove(&key).is_some() {
-                    break;
-                }
+            if let Some(&index) = self.locations.get(&key) {
+                candidate
+                    .entry(index)
+                    .or_insert_with(|| (*self.connections[index].instruments).clone())
+                    .remove(&key);
             }
         }
-        self.commit_desired(candidate, old).await
+        self.commit_desired(candidate).await
     }
 
     async fn commit_desired(
         &mut self,
-        candidate: Vec<DesiredSubscriptions>,
-        old: Vec<DesiredSubscriptions>,
+        candidate: HashMap<usize, DesiredSubscriptions>,
     ) -> Result<()> {
-        let affected: Vec<_> = candidate
-            .iter()
-            .zip(&old)
-            .enumerate()
-            .filter_map(|(index, (new, old))| (!desired_equal(new, old)).then_some(index))
+        let mut replacements: Vec<_> = candidate
+            .into_iter()
+            .filter(|(index, desired)| {
+                !desired_equal(desired, &self.connections[*index].instruments)
+            })
             .collect();
-        if affected.is_empty() {
-            return Ok(());
+        replacements.sort_by_key(|(index, _)| *index);
+        // Check every slot before changing any desired state.
+        for (index, _) in &replacements {
+            let c = &self.connections[*index];
+            if c.task.as_ref().is_some_and(|task| task.is_finished())
+                || (c.task.is_none() && c.command_rx.is_none())
+            {
+                return Err(DhanError::InvalidArgument(format!(
+                    "{} supervisor unavailable",
+                    c.id
+                )));
+            }
         }
-
-        // Desired state is committed before network work. Every supervisor
-        // acknowledges its local replacement; if a task unexpectedly vanished,
-        // all manager-side state is rolled back and previously updated tasks are
-        // restored before the error is returned.
+        let old: Vec<_> = replacements
+            .iter()
+            .map(|(index, _)| (*index, self.connections[*index].instruments.clone()))
+            .collect();
         let mut newly_spawned = HashSet::new();
-        for &index in &affected {
-            self.connections[index].instruments = candidate[index].clone();
+        for (index, desired) in replacements {
+            self.connections[index].instruments = Arc::new(desired);
             self.connections[index].desired_generation =
                 self.connections[index].desired_generation.saturating_add(1);
             if self.ensure_supervisor(index)? {
                 newly_spawned.insert(index);
             }
         }
-
         let mut applied = Vec::new();
-        for &index in &affected {
+        for (index, _) in &old {
+            let index = *index;
             if newly_spawned.contains(&index) {
-                // The initial desired generation is moved into the newly
-                // spawned supervisor, so no duplicate command is needed.
                 applied.push(index);
                 continue;
             }
@@ -674,34 +734,54 @@ impl DhanFeedManager {
                 desired: self.connections[index].instruments.clone(),
                 acknowledged,
             };
-            let result = self.connections[index].command_tx.send(command).await;
-            if result.is_ok() && receiver.await.is_ok() {
+            if self.connections[index]
+                .command_tx
+                .send(command)
+                .await
+                .is_ok()
+                && receiver.await.is_ok()
+            {
                 applied.push(index);
                 continue;
             }
-
-            for &rollback_index in &affected {
-                self.connections[rollback_index].instruments = old[rollback_index].clone();
-                self.connections[rollback_index].desired_generation = self.connections
-                    [rollback_index]
+            for (rollback_index, previous) in &old {
+                self.connections[*rollback_index].instruments = previous.clone();
+                self.connections[*rollback_index].desired_generation = self.connections
+                    [*rollback_index]
                     .desired_generation
                     .saturating_add(1);
             }
             for rollback_index in applied {
-                let (acknowledged, _) = oneshot::channel();
-                let _ = self.connections[rollback_index]
+                let (acknowledged, receiver) = oneshot::channel();
+                if self.connections[rollback_index]
                     .command_tx
                     .send(SupervisorCommand::ReplaceDesired {
                         generation: self.connections[rollback_index].desired_generation,
-                        desired: old[rollback_index].clone(),
+                        desired: self.connections[rollback_index].instruments.clone(),
                         acknowledged,
                     })
-                    .await;
+                    .await
+                    .is_ok()
+                {
+                    let _ = receiver.await;
+                }
+            }
+            for (rollback_index, _) in &old {
+                prune_previous_close(&self.connections[*rollback_index]);
             }
             return Err(DhanError::InvalidArgument(format!(
                 "{} supervisor unavailable",
                 self.connections[index].id
             )));
+        }
+        for (index, previous) in old {
+            for key in previous.keys() {
+                self.locations.remove(key);
+            }
+            for key in self.connections[index].instruments.keys() {
+                self.locations.insert(key.clone(), index);
+            }
+            prune_previous_close(&self.connections[index]);
         }
         Ok(())
     }
@@ -740,9 +820,16 @@ impl DhanFeedManager {
             auto_reconnect: self.config.auto_reconnect,
             retry_base: Duration::from_millis(self.config.reconnect_delay_ms),
             enable_raw: self.config.enable_raw_frames,
-            parsed_capacity: self.config.parsed_channel_capacity,
-            raw_capacity: self.config.raw_channel_capacity,
-            parsed_tx: self.connections[index].parsed_tx.clone(),
+            parsed_tx: self.connections[index].parsed_tx.as_ref().map(|cell| {
+                cell.get_or_init(|| {
+                    broadcast::channel(self.config.parsed_channel_capacity.max(1)).0
+                })
+                .clone()
+            }),
+            batch_tx: self.connections[index].batch_tx.clone(),
+            recycled_rx: self.connections[index].recycled_rx.take(),
+            consumer_lag: self.connections[index].consumer_lag.clone(),
+            reference_keys: desired_reference_keys(&self.connections[index].instruments),
             raw_tx: self.connections[index].raw_tx.clone(),
             lifecycle_tx: self.connections[index].lifecycle_tx.clone(),
             health_tx: self.connections[index].health_tx.clone(),
@@ -756,39 +843,69 @@ impl DhanFeedManager {
         Ok(true)
     }
 
+    /// Subscribe to individual events in Events mode. Overflow is reported
+    /// when this receiver observes an actual Tokio Lagged error.
     pub fn get_parsed_channel(
         &self,
         id: ConnectionId,
-    ) -> Option<broadcast::Receiver<MarketFeedEvent>> {
-        self.connections
-            .get(id.0 as usize)
-            .map(|connection| connection.parsed_tx.subscribe())
+    ) -> Option<ManagedMarketFeedReceiver<MarketFeedEvent>> {
+        let c = self.connections.get(id.0 as usize)?;
+        let sender = c
+            .parsed_tx
+            .as_ref()?
+            .get_or_init(|| broadcast::channel(self.config.parsed_channel_capacity.max(1)).0);
+        Some(ManagedMarketFeedReceiver {
+            rx: sender.subscribe(),
+            lag: Some(c.consumer_lag.clone()),
+        })
     }
 
     pub fn get_all_parsed_channels(
         &self,
-    ) -> Vec<(ConnectionId, broadcast::Receiver<MarketFeedEvent>)> {
+    ) -> Vec<(ConnectionId, ManagedMarketFeedReceiver<MarketFeedEvent>)> {
         self.connections
             .iter()
-            .map(|connection| (connection.id, connection.parsed_tx.subscribe()))
+            .filter_map(|c| self.get_parsed_channel(c.id).map(|rx| (c.id, rx)))
             .collect()
     }
 
-    pub fn get_raw_channel(&self, id: ConnectionId) -> Option<broadcast::Receiver<Bytes>> {
-        self.connections
-            .get(id.0 as usize)
-            .and_then(|connection| connection.raw_tx.as_ref().map(broadcast::Sender::subscribe))
+    /// Take the single primary batch consumer for a connection, once only.
+    /// No parsed broadcast is allocated in Batches mode.
+    pub fn get_batch_channel(&self, id: ConnectionId) -> Option<MarketFeedBatchReceiver> {
+        let c = self.connections.get(id.0 as usize)?;
+        let receiver = c
+            .batch_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()?;
+        receiver.state.claimed.store(true, Ordering::Release);
+        Some(receiver)
     }
 
-    pub fn get_all_raw_channels(&self) -> Vec<(ConnectionId, broadcast::Receiver<Bytes>)> {
+    pub fn get_all_batch_channels(&self) -> Vec<(ConnectionId, MarketFeedBatchReceiver)> {
         self.connections
             .iter()
-            .filter_map(|connection| {
-                connection
-                    .raw_tx
-                    .as_ref()
-                    .map(|sender| (connection.id, sender.subscribe()))
+            .filter_map(|c| self.get_batch_channel(c.id).map(|rx| (c.id, rx)))
+            .collect()
+    }
+
+    /// Raw frames are diagnostic observers; their lag cannot degrade the
+    /// authoritative parsed or batch output.
+    pub fn get_raw_channel(&self, id: ConnectionId) -> Option<ManagedMarketFeedReceiver<Bytes>> {
+        self.connections
+            .get(id.0 as usize)?
+            .raw_tx
+            .as_ref()
+            .map(|tx| ManagedMarketFeedReceiver {
+                rx: tx.subscribe(),
+                lag: None,
             })
+    }
+
+    pub fn get_all_raw_channels(&self) -> Vec<(ConnectionId, ManagedMarketFeedReceiver<Bytes>)> {
+        self.connections
+            .iter()
+            .filter_map(|c| self.get_raw_channel(c.id).map(|rx| (c.id, rx)))
             .collect()
     }
 
@@ -815,16 +932,24 @@ impl DhanFeedManager {
     /// Retrieve cached one-shot Previous Close events, including values that
     /// arrived before a broadcast receiver was created.
     pub fn previous_close_snapshot(&self, id: ConnectionId) -> Vec<MarketFeedEvent> {
+        self.previous_close_records(id)
+            .into_iter()
+            .map(|value| value.event())
+            .collect()
+    }
+
+    /// Current receipt-session reference records for currently desired instruments.
+    /// Receipt metadata establishes cache age, never price freshness or liveness.
+    pub fn previous_close_records(&self, id: ConnectionId) -> Vec<PreviousCloseRecord> {
+        let today = reference_session_date(SystemTime::now());
         self.connections
             .get(id.0 as usize)
-            .map(|connection| {
-                connection
-                    .previous_close
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .values()
-                    .cloned()
-                    .collect()
+            .map(|c| {
+                let keys = desired_reference_keys(&c.instruments);
+                let mut cache = c.previous_close.lock().unwrap_or_else(|p| p.into_inner());
+                cache
+                    .retain(|key, value| keys.contains(key) && value.receipt_session_date == today);
+                cache.values().cloned().collect()
             })
             .unwrap_or_default()
     }
@@ -863,7 +988,7 @@ impl DhanFeedManager {
         let mut first_error = None;
         for connection in &mut self.connections {
             if connection.task.is_none() {
-                connection.instruments.clear();
+                connection.instruments = Arc::new(HashMap::new());
                 continue;
             }
             let (acknowledged, receiver) = oneshot::channel();
@@ -898,7 +1023,7 @@ impl DhanFeedManager {
                     });
                 }
             }
-            connection.instruments.clear();
+            connection.instruments = Arc::new(HashMap::new());
             connection.desired_generation = 0;
             connection
                 .previous_close
@@ -909,6 +1034,7 @@ impl DhanFeedManager {
             connection.command_tx = command_tx;
             connection.command_rx = Some(command_rx);
         }
+        self.locations.clear();
         self.started = false;
         if let Some(error) = first_error {
             Err(DhanError::InvalidArgument(error))
@@ -946,16 +1072,18 @@ struct SupervisorArguments {
     auto_reconnect: bool,
     retry_base: Duration,
     enable_raw: bool,
-    parsed_capacity: usize,
-    raw_capacity: usize,
-    parsed_tx: broadcast::Sender<MarketFeedEvent>,
+    parsed_tx: Option<broadcast::Sender<MarketFeedEvent>>,
+    batch_tx: Option<BatchSender>,
+    recycled_rx: Option<mpsc::Receiver<Vec<MarketFeedEvent>>>,
+    consumer_lag: Arc<ConsumerLag>,
+    reference_keys: HashSet<(u8, u32)>,
     raw_tx: Option<broadcast::Sender<Bytes>>,
     lifecycle_tx: broadcast::Sender<ManagerLifecycleEvent>,
     health_tx: watch::Sender<ConnectionHealth>,
     credentials_rx: watch::Receiver<Credentials>,
     command_rx: mpsc::Receiver<SupervisorCommand>,
-    previous_close: Arc<StdMutex<HashMap<(u8, u32), MarketFeedEvent>>>,
-    desired: DesiredSubscriptions,
+    previous_close: Arc<StdMutex<HashMap<(u8, u32), PreviousCloseRecord>>>,
+    desired: Arc<DesiredSubscriptions>,
     generation: u64,
 }
 
@@ -970,7 +1098,7 @@ impl Reporter {
         let _ = self.health_tx.send(self.snapshot.clone());
     }
 
-    fn state(&mut self, state: ConnectionLifecycle) {
+    fn set_state(&mut self, state: ConnectionLifecycle) {
         if self.snapshot.lifecycle != state {
             self.snapshot.lifecycle = state;
             self.snapshot.last_state_change_at = SystemTime::now();
@@ -979,6 +1107,10 @@ impl Reporter {
                 state,
             });
         }
+    }
+
+    fn state(&mut self, state: ConnectionLifecycle) {
+        self.set_state(state);
         self.publish();
     }
 
@@ -1007,9 +1139,9 @@ impl Reporter {
         self.snapshot.data_live = true;
         if self.snapshot.data_quality != MarketDataQuality::GapDetected {
             self.snapshot.data_quality = MarketDataQuality::Current;
-            self.state(ConnectionLifecycle::Live);
+            self.set_state(ConnectionLifecycle::Live);
         } else {
-            self.state(ConnectionLifecycle::Degraded);
+            self.set_state(ConnectionLifecycle::Degraded);
         }
     }
 
@@ -1101,6 +1233,7 @@ async fn supervisor(mut args: SupervisorArguments) {
     let mut shutdown_error = None;
 
     'owner: loop {
+        report_consumer_lag(&args.consumer_lag, &mut reporter);
         if args.desired.is_empty() {
             reporter.snapshot.transport_connected = false;
             reporter.snapshot.data_live = false;
@@ -1361,6 +1494,7 @@ fn handle_command(
             acknowledged,
         }) => {
             args.generation = generation;
+            args.reference_keys = desired_reference_keys(&desired);
             args.desired = desired;
             reporter.snapshot.instrument_count = args.desired.len();
             reporter.snapshot.desired_generation = generation;
@@ -1394,7 +1528,7 @@ async fn connect_with_commands(
     reporter: &mut Reporter,
 ) -> ConnectOutcome {
     tokio::select! {
-        result = timeout(CONNECT_TIMEOUT, connect_async(url.as_str())) => {
+        result = timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async_with_config(url.as_str(), Some(tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE_BYTES)).max_frame_size(Some(MAX_MESSAGE_BYTES))), false)) => {
             match result {
                 Ok(Ok((socket, _))) => ConnectOutcome::Connected(Box::new(socket)),
                 Ok(Err(error)) => ConnectOutcome::Failed(format!("WebSocket connect failed: {error}")),
@@ -1427,7 +1561,8 @@ async fn run_connected(
     ever_live: &mut bool,
     connection_credential_version: u64,
 ) -> ConnectedOutcome {
-    let mut applied = DesiredSubscriptions::new();
+    let mut applied = Arc::new(DesiredSubscriptions::new());
+    let mut events = Vec::new();
     let connected_at = Instant::now();
 
     loop {
@@ -1453,7 +1588,8 @@ async fn run_connected(
                     match command {
                         Some(SupervisorCommand::ReplaceDesired { generation, desired, acknowledged }) => {
                             args.generation = generation;
-                            args.desired = desired;
+                            args.reference_keys = desired_reference_keys(&desired);
+            args.desired = desired;
                             reporter.snapshot.instrument_count = args.desired.len();
                             reporter.snapshot.desired_generation = generation;
                             reporter.publish();
@@ -1497,6 +1633,9 @@ async fn run_connected(
                     record_transport_loss(reporter, *ever_live, None, error);
                     return ConnectedOutcome::Retry;
                 }
+                _ = args.consumer_lag.notify.notified() => {
+                    report_consumer_lag(&args.consumer_lag, reporter);
+                }
                 message = socket.next() => {
                     let now = SystemTime::now();
                     reporter.snapshot.last_frame_at = Some(now);
@@ -1510,67 +1649,62 @@ async fn run_connected(
                             }
                             if args.enable_raw {
                                 if let Some(sender) = &args.raw_tx {
-                                    detect_lag(
-                                        sender,
-                                        args.raw_capacity,
-                                        args.id,
-                                        &args.lifecycle_tx,
-                                        reporter,
-                                    );
-                                    let _ = sender.send(Bytes::copy_from_slice(&data));
+                                    // Tungstenite already supplies shared Bytes.
+                                    let _ = sender.send(data.clone());
                                 }
                             }
-                            match parse_packets(&data) {
-                                Ok(events) => {
-                                    let has_receiver = args.parsed_tx.receiver_count() > 0;
-                                    for event in events {
-                                        if let MarketFeedEvent::PrevClose { header, .. } = &event {
-                                            args.previous_close
-                                                .lock()
-                                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                                .insert((header.exchange_segment_raw, header.security_id), event.clone());
-                                            if !has_receiver {
-                                                let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
-                                                    id: args.id,
-                                                    event: "previous-close-cached",
+                            if events.capacity() == 0 {
+                                if let Some(recycled) = &mut args.recycled_rx {
+                                    if let Ok(buffer) = recycled.try_recv() { events = buffer; }
+                                }
+                            }
+                            match parse_packets_into(&data, &mut events) {
+                                Ok(()) => {
+                                    let disconnect = events.iter().enumerate().find_map(|(index, event)| match event {
+                                        MarketFeedEvent::Disconnect { reason_code, .. } => Some((index, *reason_code)),
+                                        _ => None,
+                                    });
+                                    if let Some((index, _)) = disconnect { events.truncate(index + 1); }
+                                    for event in &events {
+                                        if let MarketFeedEvent::PrevClose { header, prev_close, prev_oi } = event {
+                                            let key = (header.exchange_segment_raw, header.security_id);
+                                            if args.reference_keys.contains(&key) {
+                                                args.previous_close.lock().unwrap_or_else(|p| p.into_inner()).insert(key, PreviousCloseRecord {
+                                                    header: *header, prev_close: *prev_close, prev_oi: *prev_oi,
+                                                    received_at: now, receipt_session_date: reference_session_date(now),
                                                 });
                                             }
-                                        } else if !has_receiver {
-                                            let event_name = market_event_name(&event);
-                                            let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::NoReceiver {
-                                                id: args.id,
-                                                event: event_name,
-                                            });
-                                            reporter.gap(GapCause::NoReceiver { event: event_name });
                                         }
-                                        let dhan_disconnect = match &event {
-                                            MarketFeedEvent::Disconnect { reason_code, .. } => Some(*reason_code),
-                                            _ => None,
-                                        };
-                                        detect_lag(
-                                            &args.parsed_tx,
-                                            args.parsed_capacity,
-                                            args.id,
-                                            &args.lifecycle_tx,
-                                            reporter,
-                                        );
-                                        let _ = args.parsed_tx.send(event);
-                                        if let Some(reason_code) = dhan_disconnect {
-                                            let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::DhanDisconnected {
-                                                id: args.id,
-                                                reason_code,
-                                            });
-                                            let error = format!("Dhan disconnected feed with reason {reason_code}");
-                                            reporter.error(error.clone());
-                                            record_transport_loss(reporter, *ever_live, None, error);
-                                            return match reason_code {
-                                                807..=809 => ConnectedOutcome::WaitForCredential(connection_credential_version),
-                                                804 | 806 | 810..=814 => ConnectedOutcome::Blocked,
-                                                _ => ConnectedOutcome::Retry,
-                                            };
-                                        }
+                                    }
+                                    let missing_event = events.iter().find(|event| !matches!(event, MarketFeedEvent::PrevClose { .. })).map(market_event_name);
+                                    if events.iter().any(|event| !matches!(event, MarketFeedEvent::Disconnect { .. })) {
                                         *ever_live = true;
                                         reporter.valid_data();
+                                    }
+                                    if let Some(sender) = &args.batch_tx {
+                                        match sender.send(&mut events, now) {
+                                            Ok(()) => {},
+                                            Err(BatchSendError::NoReceiver) => report_no_receiver(reporter, missing_event),
+                                            Err(BatchSendError::Overflow(dropped)) => report_receiver_lag(reporter, dropped),
+                                        }
+                                    } else if let Some(sender) = &args.parsed_tx {
+                                        for event in events.drain(..) {
+                                            if let Err(error) = sender.send(event) {
+                                                let name = (!matches!(error.0, MarketFeedEvent::PrevClose { .. })).then(|| market_event_name(&error.0));
+                                                report_no_receiver(reporter, name);
+                                            }
+                                        }
+                                    }
+                                    if let Some((_, reason_code)) = disconnect {
+                                        let _ = args.lifecycle_tx.send(ManagerLifecycleEvent::DhanDisconnected { id: args.id, reason_code });
+                                        let error = format!("Dhan disconnected feed with reason {reason_code}");
+                                        reporter.error(error.clone());
+                                        record_transport_loss(reporter, *ever_live, None, error);
+                                        return match reason_code {
+                                            807..=809 => ConnectedOutcome::WaitForCredential(connection_credential_version),
+                                            804 | 806 | 810..=814 => ConnectedOutcome::Blocked,
+                                            _ => ConnectedOutcome::Retry,
+                                        };
                                     }
                                 }
                                 Err(error) => {
@@ -1645,19 +1779,93 @@ fn market_event_name(event: &MarketFeedEvent) -> &'static str {
     }
 }
 
-fn detect_lag<T: Clone>(
-    sender: &broadcast::Sender<T>,
-    capacity: usize,
-    id: ConnectionId,
-    lifecycle_tx: &broadcast::Sender<ManagerLifecycleEvent>,
-    reporter: &mut Reporter,
-) {
-    if sender.receiver_count() > 0 && sender.len() >= capacity {
-        reporter.snapshot.lagged_event_count =
-            reporter.snapshot.lagged_event_count.saturating_add(1);
-        let _ = lifecycle_tx.send(ManagerLifecycleEvent::ReceiverLag { id, dropped: 1 });
-        reporter.gap(GapCause::ReceiverLag { dropped: 1 });
+fn report_receiver_lag(reporter: &mut Reporter, dropped: u64) {
+    reporter.snapshot.lagged_event_count =
+        reporter.snapshot.lagged_event_count.saturating_add(dropped);
+    let _ = reporter
+        .lifecycle_tx
+        .send(ManagerLifecycleEvent::ReceiverLag {
+            id: reporter.snapshot.id,
+            dropped,
+        });
+    reporter.gap(GapCause::ReceiverLag { dropped });
+}
+
+fn report_consumer_lag(lag: &ConsumerLag, reporter: &mut Reporter) {
+    let dropped = lag.dropped.swap(0, Ordering::AcqRel);
+    if dropped > 0 {
+        report_receiver_lag(reporter, dropped);
     }
+}
+
+fn report_no_receiver(reporter: &mut Reporter, event: Option<&'static str>) {
+    let event_name = event.unwrap_or("previous-close-cached");
+    let _ = reporter
+        .lifecycle_tx
+        .send(ManagerLifecycleEvent::NoReceiver {
+            id: reporter.snapshot.id,
+            event: event_name,
+        });
+    if let Some(event) = event {
+        reporter.gap(GapCause::NoReceiver { event });
+    }
+}
+
+/// Compact one-shot reference value and explicit local receipt-session metadata.
+#[derive(Debug, Clone)]
+pub struct PreviousCloseRecord {
+    pub header: PacketHeader,
+    pub prev_close: f32,
+    pub prev_oi: i32,
+    pub received_at: SystemTime,
+    /// IST calendar date of receipt, not an exchange-provided timestamp.
+    pub receipt_session_date: NaiveDate,
+}
+
+impl PreviousCloseRecord {
+    fn event(self) -> MarketFeedEvent {
+        MarketFeedEvent::PrevClose {
+            header: self.header,
+            prev_close: self.prev_close,
+            prev_oi: self.prev_oi,
+        }
+    }
+}
+
+fn prune_previous_close(connection: &ManagedConnection) {
+    let keys = desired_reference_keys(&connection.instruments);
+    let today = reference_session_date(SystemTime::now());
+    connection
+        .previous_close
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|key, value| keys.contains(key) && value.receipt_session_date == today);
+}
+
+fn reference_session_date(time: SystemTime) -> NaiveDate {
+    DateTime::<Utc>::from(time)
+        .with_timezone(&FixedOffset::east_opt(19_800).expect("valid IST offset"))
+        .date_naive()
+}
+
+fn desired_reference_keys(desired: &DesiredSubscriptions) -> HashSet<(u8, u32)> {
+    desired
+        .values()
+        .filter_map(|(instrument, _)| {
+            let code = match instrument.ExchangeSegment.as_str() {
+                "IDX_I" => 0,
+                "NSE_EQ" => 1,
+                "NSE_FNO" => 2,
+                "NSE_CURRENCY" => 3,
+                "BSE_EQ" => 4,
+                "MCX_COMM" => 5,
+                "BSE_CURRENCY" => 7,
+                "BSE_FNO" => 8,
+                _ => return None,
+            };
+            instrument.SecurityId.parse().ok().map(|id| (code, id))
+        })
+        .collect()
 }
 
 fn record_transport_loss(
@@ -1864,5 +2072,129 @@ fn unsubscribe_code(mode: FeedRequestCode) -> u8 {
         FeedRequestCode::SubscribeQuote => FeedRequestCode::UnsubscribeQuote as u8,
         FeedRequestCode::SubscribeFull => FeedRequestCode::UnsubscribeFull as u8,
         _ => unreachable!("desired state contains only validated subscription modes"),
+    }
+}
+
+#[cfg(test)]
+mod delivery_health_tests {
+    use super::*;
+    #[test]
+    fn valid_data_defers_health_publication_until_the_message_is_complete() {
+        let (health_tx, mut health_rx) = watch::channel(ConnectionHealth::new(ConnectionId(0)));
+        let (lifecycle_tx, mut lifecycle_rx) = broadcast::channel(8);
+        let mut reporter = Reporter {
+            snapshot: health_rx.borrow().clone(),
+            health_tx,
+            lifecycle_tx,
+        };
+        for _ in 0..100 {
+            reporter.valid_data();
+        }
+        assert!(
+            !health_rx.has_changed().unwrap(),
+            "packet processing must not publish health"
+        );
+        assert!(matches!(
+            lifecycle_rx.try_recv(),
+            Ok(ManagerLifecycleEvent::StateChanged {
+                state: ConnectionLifecycle::Live,
+                ..
+            })
+        ));
+        reporter.publish();
+        assert_eq!(
+            health_rx.borrow_and_update().lifecycle,
+            ConnectionLifecycle::Live
+        );
+        assert!(!health_rx.has_changed().unwrap());
+        reporter.gap(GapCause::ReceiverLag { dropped: 7 });
+        assert!(
+            health_rx.has_changed().unwrap(),
+            "gaps must publish immediately"
+        );
+    }
+
+    #[test]
+    fn reference_snapshots_intersect_restored_ownership_after_a_rollback() {
+        let mut manager = DhanFeedManager::new("client", "token", DhanFeedConfig::default());
+        let instrument = Instrument::new("NSE_EQ", "101");
+        manager.connections[0].instruments = Arc::new(HashMap::from([(
+            InstrumentKey::from(&instrument),
+            (instrument, FeedRequestCode::SubscribeTicker),
+        )]));
+        let packet = [6, 16, 0, 1, 101, 0, 0, 0, 0, 0, 200, 66, 1, 0, 0, 0];
+        let MarketFeedEvent::PrevClose {
+            header,
+            prev_close,
+            prev_oi,
+        } = crate::ws::market_feed::parse_packet(&packet).unwrap()
+        else {
+            panic!()
+        };
+        let now = SystemTime::now();
+        let record = PreviousCloseRecord {
+            header,
+            prev_close,
+            prev_oi,
+            received_at: now,
+            receipt_session_date: reference_session_date(now),
+        };
+        let mut unowned = record.clone();
+        unowned.header.security_id = 999;
+        let mut cache = manager.connections[0].previous_close.lock().unwrap();
+        cache.insert((1, 101), record);
+        cache.insert((1, 999), unowned);
+        drop(cache);
+        let records = manager.previous_close_records(ConnectionId(0));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].header.security_id, 101);
+        assert_eq!(
+            manager.connections[0].previous_close.lock().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn old_reference_sessions_are_not_exposed_as_current() {
+        let manager = DhanFeedManager::new("client", "token", DhanFeedConfig::default());
+        let packet = [6, 16, 0, 1, 101, 0, 0, 0, 0, 0, 200, 66, 1, 0, 0, 0];
+        let MarketFeedEvent::PrevClose {
+            header,
+            prev_close,
+            prev_oi,
+        } = crate::ws::market_feed::parse_packet(&packet).unwrap()
+        else {
+            panic!()
+        };
+        let yesterday = SystemTime::now() - Duration::from_secs(86_400);
+        manager.connections[0]
+            .previous_close
+            .lock()
+            .unwrap()
+            .insert(
+                (1, 101),
+                PreviousCloseRecord {
+                    header,
+                    prev_close,
+                    prev_oi,
+                    received_at: yesterday,
+                    receipt_session_date: reference_session_date(yesterday),
+                },
+            );
+        assert!(manager.previous_close_snapshot(ConnectionId(0)).is_empty());
+        assert!(
+            manager.connections[0]
+                .previous_close
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            manager
+                .connections
+                .iter()
+                .all(|c| c.parsed_tx.as_ref().unwrap().get().is_none()),
+            "idle slots must not allocate parsed rings"
+        );
     }
 }

@@ -1,8 +1,9 @@
 //! Order management endpoints.
 
 use crate::client::{DhanClient, required_path_segment};
-use crate::error::Result;
+use crate::error::{DhanError, Result};
 use crate::types::orders::*;
+use serde::Deserialize;
 
 impl DhanClient {
     /// Place a new order.
@@ -27,9 +28,11 @@ impl DhanClient {
     /// Cancel a pending order.
     ///
     /// **Endpoint:** `DELETE /v2/orders/{order-id}`
-    pub async fn cancel_order(&self, order_id: &str) -> Result<OrderResponse> {
-        let order_id = required_path_segment("order_id", order_id)?;
-        self.delete(&format!("/v2/orders/{order_id}")).await
+    /// Empty 202/204 responses return Accepted, without inventing a final status.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<CancellationOutcome> {
+        let path_id = required_path_segment("order_id", order_id)?;
+        self.delete_cancellation(&format!("/v2/orders/{path_id}"), order_id)
+            .await
     }
 
     /// Slice an order into multiple legs (for quantities over freeze limit).
@@ -74,7 +77,29 @@ impl DhanClient {
     ///
     /// **Endpoint:** `GET /v2/trades/{order-id}`
     pub async fn get_trades_for_order(&self, order_id: &str) -> Result<Vec<TradeDetail>> {
-        let order_id = required_path_segment("order_id", order_id)?;
-        self.get(&format!("/v2/trades/{order_id}")).await
+        let path_id = required_path_segment("order_id", order_id)?;
+        let response: TradesForOrderResponse = self.get(&format!("/v2/trades/{path_id}")).await?;
+        let trades = match response {
+            TradesForOrderResponse::Many(trades) => trades,
+            TradesForOrderResponse::One(trade) => vec![*trade],
+        };
+        if trades
+            .iter()
+            .any(|trade| trade.order_id.as_deref() != Some(order_id))
+        {
+            return Err(DhanError::InvalidArgument(
+                "trade response order ID is missing or does not match request".into(),
+            ));
+        }
+        Ok(trades)
     }
+}
+
+// HTML documents an object; OpenAPI documents an array. Accept either known
+// shape, then validate identity instead of accepting arbitrary success objects.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TradesForOrderResponse {
+    Many(Vec<TradeDetail>),
+    One(Box<TradeDetail>),
 }

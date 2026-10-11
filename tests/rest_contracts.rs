@@ -369,7 +369,9 @@ async fn super_order_cancel_supports_json_and_empty_success_contracts() {
         .cancel_super_order("order-1", "TARGET_LEG")
         .await
         .unwrap();
-    assert_eq!(response.order_id, "order-1");
+    assert!(
+        matches!(response, dhan_rs::types::orders::CancellationOutcome::Reported(ref order) if order.order_id == "order-1")
+    );
     let received = request_rx.await.unwrap();
     assert!(
         std::str::from_utf8(&received)
@@ -390,4 +392,76 @@ async fn super_order_cancel_supports_json_and_empty_success_contracts() {
             .unwrap()
             .starts_with("DELETE /v2/super/orders/order-1/STOP_LOSS_LEG HTTP/1.1\r\n")
     );
+}
+
+#[tokio::test]
+async fn cancellations_accept_empty_responses_without_fabricating_final_status() {
+    use dhan_rs::types::orders::CancellationOutcome;
+    for super_order in [false, true] {
+        for status in ["202 Accepted", "204 No Content"] {
+            let (url, request) = serve_once(http_response(status, &[], "")).await;
+            let client = DhanClient::with_base_url("local-client", "local-token", url);
+            let outcome = if super_order {
+                client.cancel_super_order("order-1", "ENTRY_LEG").await
+            } else {
+                client.cancel_order("order-1").await
+            }
+            .unwrap();
+            assert!(
+                matches!(outcome, CancellationOutcome::Accepted { order_id } if order_id == "order-1")
+            );
+            assert!(
+                String::from_utf8(request.await.unwrap())
+                    .unwrap()
+                    .starts_with("DELETE /v2/")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellations_reject_empty_200_malformed_json_wrong_identity_and_http_errors() {
+    for (status, body) in [
+        ("200 OK", ""),
+        ("202 Accepted", "{"),
+        (
+            "200 OK",
+            r#"{"orderId":"wrong-order","orderStatus":"CANCELLED"}"#,
+        ),
+        (
+            "429 Too Many Requests",
+            r#"{"errorCode":"DH-904","errorMessage":"rate limited"}"#,
+        ),
+    ] {
+        let (url, request) = serve_once(http_response(status, &[], body)).await;
+        let client = DhanClient::with_base_url("local-client", "local-token", url);
+        assert!(client.cancel_order("order-1").await.is_err());
+        request.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn trades_for_order_accepts_both_documented_shapes_and_checks_identity() {
+    let trade = r#"{"orderId":"order-1","exchangeTradeId":"trade-1","tradedQuantity":2,"tradedPrice":101.5}"#;
+    for body in [trade.to_owned(), format!("[{trade}]"), "[]".into()] {
+        let (url, request) = serve_once(http_response("200 OK", &[], &body)).await;
+        let client = DhanClient::with_base_url("local-client", "local-token", url);
+        let trades = client.get_trades_for_order("order-1").await.unwrap();
+        assert_eq!(trades.len(), usize::from(body != "[]"));
+        if let Some(trade) = trades.first() {
+            assert_eq!(trade.order_id.as_deref(), Some("order-1"));
+        }
+        request.await.unwrap();
+    }
+    for body in [
+        "{}",
+        "null",
+        r#"{"orderId":"another"}"#,
+        r#"[{"orderId":"order-1"},{"orderId":"another"}]"#,
+    ] {
+        let (url, request) = serve_once(http_response("200 OK", &[], body)).await;
+        let client = DhanClient::with_base_url("local-client", "local-token", url);
+        assert!(client.get_trades_for_order("order-1").await.is_err());
+        request.await.unwrap();
+    }
 }

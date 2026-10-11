@@ -106,6 +106,16 @@ pub struct OrderResponse {
     pub order_status: String,
 }
 
+/// Result of a cancellation request. An accepted request is not proof that
+/// the order reached its final cancelled state; reconcile using order updates.
+#[derive(Debug, Clone)]
+pub enum CancellationOutcome {
+    /// Dhan accepted the request with an empty 202/204 response.
+    Accepted { order_id: String },
+    /// Dhan returned an explicit order/status response.
+    Reported(OrderResponse),
+}
+
 // ---------------------------------------------------------------------------
 // Order Detail (Order Book entry)
 // ---------------------------------------------------------------------------

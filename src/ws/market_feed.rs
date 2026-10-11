@@ -371,7 +371,10 @@ pub fn parse_header(data: &[u8]) -> Result<PacketHeader> {
 /// [`DhanFeedManager::get_raw_channel`](super::manager::DhanFeedManager::get_raw_channel)
 /// after splitting them into individual packets.
 pub fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
-    let header = parse_header(data)?;
+    parse_packet_with_header(data, parse_header(data)?)
+}
+
+fn parse_packet_with_header(data: &[u8], header: PacketHeader) -> Result<MarketFeedEvent> {
     if usize::from(header.message_length) != data.len() {
         return Err(invalid_packet(format!(
             "declared packet length {} does not match WebSocket binary message length {}",
@@ -561,19 +564,40 @@ pub fn parse_packet(data: &[u8]) -> Result<MarketFeedEvent> {
 /// all-or-nothing: no event is returned unless the complete message is a
 /// bounded sequence of individually valid packets.
 pub fn parse_packets(data: &[u8]) -> Result<Vec<MarketFeedEvent>> {
+    let mut events = Vec::new();
+    parse_packets_into(data, &mut events)?;
+    Ok(events)
+}
+
+/// Decode a complete message using a reusable allocation. The output is cleared
+/// before parsing and remains empty on every error, including malformed tails.
+pub fn parse_packets_into(data: &[u8], events: &mut Vec<MarketFeedEvent>) -> Result<()> {
+    events.clear();
+    let result = parse_packets_inner(data, events);
+    if result.is_err() {
+        events.clear();
+    }
+    result
+}
+
+// Bound variable-length payloads as well as the number of packets. Normal
+// maximum Full bursts occupy less than 3 MiB; 8 MiB leaves room for status data.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+fn parse_packets_inner(data: &[u8], events: &mut Vec<MarketFeedEvent>) -> Result<()> {
     if data.is_empty() {
         return Err(invalid_packet("empty market-feed binary message"));
     }
-
+    if data.len() > MAX_MESSAGE_BYTES {
+        return Err(invalid_packet("market-feed binary message exceeds 8 MiB"));
+    }
     let mut remaining = data;
-    let mut events = Vec::new();
     while !remaining.is_empty() {
         if events.len() >= MAX_PACKETS_PER_MESSAGE {
             return Err(invalid_packet(format!(
                 "market-feed binary message exceeds {MAX_PACKETS_PER_MESSAGE} packets"
             )));
         }
-
         let header = parse_header(remaining)?;
         let packet_len = usize::from(header.message_length);
         if packet_len < 8 {
@@ -587,13 +611,11 @@ pub fn parse_packets(data: &[u8]) -> Result<Vec<MarketFeedEvent>> {
                 remaining.len()
             )));
         }
-
         let (packet, rest) = remaining.split_at(packet_len);
-        events.push(parse_packet(packet)?);
+        events.push(parse_packet_with_header(packet, header)?);
         remaining = rest;
     }
-
-    Ok(events)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,5 +1136,29 @@ mod tests {
             .unwrap();
         stream.disconnect().await.unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reusable_parser_tests {
+    use super::*;
+    #[test]
+    fn reusable_output_preserves_order_capacity_and_clears_every_error() {
+        let packet = [2, 16, 0, 1, 101, 0, 0, 0, 0, 0, 200, 66, 1, 0, 0, 0];
+        let frame = packet.repeat(3);
+        let mut events = Vec::new();
+        parse_packets_into(&frame, &mut events).unwrap();
+        assert_eq!(events.len(), 3);
+        let pointer = events.as_ptr();
+        parse_packets_into(&frame, &mut events).unwrap();
+        assert_eq!(events.as_ptr(), pointer);
+        let mut malformed = frame;
+        malformed.push(2);
+        assert!(parse_packets_into(&malformed, &mut events).is_err());
+        assert!(events.is_empty());
+        assert!(parse_packets_into(&[], &mut events).is_err());
+        assert!(events.is_empty());
+        assert!(parse_packets_into(&vec![0; MAX_MESSAGE_BYTES + 1], &mut events).is_err());
+        assert!(events.is_empty());
     }
 }

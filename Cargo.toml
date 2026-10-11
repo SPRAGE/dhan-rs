@@ -1,6 +1,6 @@
 [package]
 name = "dhan-rs"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Unofficial Rust client library for the DhanHQ Broker API v2 — orders, market data, WebSocket feeds, and more"
@@ -12,7 +12,7 @@ readme = "README.md"
 keywords = ["dhan", "trading", "broker", "api", "finance"]
 categories = ["api-bindings", "finance"]
 authors = ["SPRAGE"]
-exclude = ["PLAN.md", "flake.nix", "flake.lock", ".direnv/", "publish.sh"]
+include = ["/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md", "/DISCLAIMER.md", "/CHANGELOG.md", "/src/**", "/tests/**", "/examples/**", "/docs/**", "/.env.sandbox.example"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
