@@ -223,17 +223,26 @@ impl BatchSender {
             self.overflow(count);
             return Err(BatchSendError::Overflow(count));
         }
-        if self
-            .state
-            .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes)
-                    .filter(|total| *total <= self.byte_capacity)
-            })
-            .is_err()
-        {
-            self.overflow(count);
-            return Err(BatchSendError::Overflow(count));
+        // Use the CAS primitives available at our MSRV: fetch_update was
+        // deprecated in Rust 1.99, while its replacement requires newer Rust.
+        let mut used = self.state.bytes.load(Ordering::Acquire);
+        loop {
+            let Some(total) = used
+                .checked_add(bytes)
+                .filter(|total| *total <= self.byte_capacity)
+            else {
+                self.overflow(count);
+                return Err(BatchSendError::Overflow(count));
+            };
+            match self.state.bytes.compare_exchange_weak(
+                used,
+                total,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
         }
         let batch = MarketFeedBatch {
             events: std::mem::take(events),
